@@ -47,6 +47,11 @@ from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
+try:
+    from gdi_surface import GdiSurface
+except Exception:                      # 没有 GDI 环境时退回整帧 PIL 渲染
+    GdiSurface = None
+
 # --------------------------------------------------------------------------------------
 # 常量与路径
 # --------------------------------------------------------------------------------------
@@ -1775,6 +1780,14 @@ class App:
                                mouse_cb=self._on_mouse)
         self.overlay.register_hotkeys()
         self.overlay.show()
+        self.surface = None
+        if GdiSurface is not None and not self.headless:
+            try:
+                self.surface = GdiSurface(self.overlay.hwnd, self.vx, self.vy, self.vw, self.vh)
+                logging.info("GDI 合成后端已启用")
+            except Exception:
+                logging.exception("GDI 后端初始化失败，退回整帧渲染")
+                self.surface = None
 
     def _compute_card_pos(self) -> None:
         s = self.painter.s              # 含用户缩放
@@ -2363,6 +2376,47 @@ class App:
                 _blend(frame, img, x, y)
         return frame
 
+    def render_gdi(self) -> None:
+        """GDI 合成：直接画进分层窗口的 DIB，省掉整帧预乘转换与拷贝。"""
+        surf = self.surface
+        surf.clear()
+        for flake in self.snow.flakes:
+            a = flake.alpha * max(0.0, min(1.0, flake.fade)) / 255.0
+            if a < 0.03:
+                continue
+            surf.snow(flake.x, flake.y, flake.r, a)
+        if self.show_card and self.card_img is not None:
+            x, y = self.card_pos
+            card, shadow, pad = self._display_card()
+            card_alpha = int(255 * max(0.0, min(1.0, self.card_alpha)))
+            preview = self._preview_zoom if self._resizing else None
+            key = (self.card_key, self.painter.zoom, preview, card.size)
+            surf.blit(surf.image(("shadow",) + key, shadow), x - pad, y - pad, card_alpha)
+            surf.blit(surf.image(("card",) + key, card), x, y, card_alpha)
+            if not self._resizing and (self._hover or self._dragging):
+                s = self.painter.s
+                close = self._corner_icon("close", max(13, int(round(18 * s))))
+                grip = self._corner_icon("grip", max(16, int(round(20 * s))))
+                surf.blit(surf.image(("close", close.size), close),
+                          x + card.width - close.width - max(3, int(round(5 * s))),
+                          y + max(3, int(round(5 * s))), card_alpha)
+                surf.blit(surf.image(("grip", grip.size), grip),
+                          x + card.width - grip.width - int(round(4 * s)),
+                          y + card.height - grip.height - int(round(4 * s)), card_alpha)
+        if self.toast_text:
+            if self.toast is None:
+                self.toast = (make_pill(self.art, self.toast_text), time.time() + 3.2)
+            img, expire = self.toast
+            remain = expire - time.time()
+            if remain > 0:
+                fade = int(255 * min(1.0, remain / 0.6))
+                x, y = self.card_pos
+                if self.card_img is not None:
+                    x += (self.card_img.width - img.width) // 2
+                    y -= img.height + int(10 * self.scale)
+                surf.blit(surf.image(("toast", self.toast_text, img.size), img), x, y, fade)
+        surf.present(int(255 * max(0.0, min(1.0, self.alpha))))
+
     def run(self) -> None:
         target = 1.0 / self.fps
         # 桌面模式下即使静止也要以帧率跑状态机（层级检查），但只有内容变化时才真正重绘
@@ -2382,8 +2436,16 @@ class App:
                 last = now
                 self.update(dt)
                 if self.dirty and not self.covered and self.alpha > 0.01:
-                    frame = self.render()
-                    self.overlay.blit(frame, int(255 * self.alpha))
+                    if self.surface is not None:
+                        try:
+                            self.render_gdi()
+                        except Exception:
+                            logging.exception("GDI 渲染失败，退回整帧渲染")
+                            self.surface.close()
+                            self.surface = None
+                            self.overlay.blit(self.render(), int(255 * self.alpha))
+                    else:
+                        self.overlay.blit(self.render(), int(255 * self.alpha))
                     self.dirty = False
                 busy = self.animating or desktop_mode
                 next_frame = now + (target if busy else 1.0)
@@ -2403,11 +2465,20 @@ class App:
         self.snow_started = False
         self._pos_ready = False
         self.frame = Image.new("RGBA", (self.vw, self.vh), (0, 0, 0, 0))
+        if self.surface is not None:
+            self.surface.close()
+            self.surface = None
         self._create_overlay()
         self._request_card()
 
     def shutdown(self) -> None:
         self.service.stop()
+        if self.surface is not None:
+            try:
+                self.surface.close()
+            except Exception:
+                pass
+            self.surface = None
         if self.overlay:
             self.overlay.destroy()
             self.overlay = None
