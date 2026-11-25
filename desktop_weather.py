@@ -74,6 +74,7 @@ DEFAULTS = {
     "margin": 28,
     "opacity": 0.92,
     "idle_opacity": 0.7,
+    "scale": 1.0,
     "on_desktop": True,
     "fps": 20,
     "auto_hide": False,
@@ -1102,9 +1103,20 @@ class CardPainter:
     def __init__(self, art: Art, cfg: dict):
         self.art = art
         self.cfg = cfg
-        self.s = art.s
+        self.zoom = max(0.6, min(2.0, float(cfg.get("scale", 1.0) or 1.0)))
+        self.s = art.s * self.zoom
         self._panel_cache = {}
         self._shadow_cache = {}
+
+    def set_zoom(self, zoom: float) -> None:
+        """调整卡片缩放：所有设计尺寸按 zoom 等比放大，缓存随之失效。"""
+        zoom = max(0.6, min(2.0, float(zoom)))
+        if abs(zoom - self.zoom) < 1e-4:
+            return
+        self.zoom = zoom
+        self.s = self.art.s * zoom
+        self._panel_cache.clear()
+        self._shadow_cache.clear()
 
     # -- 面板底 ----------------------------------------------------------------
     def _panel(self, snowy: bool) -> Image.Image:
@@ -1226,6 +1238,28 @@ class CardPainter:
 
         panel.alpha_composite(layer)
         return panel, shadow, pad
+
+
+def make_corner_button(size_px: int, kind: str = "close") -> Image.Image:
+    """卡片右上角关闭按钮 / 右下角缩放手柄的小图标（3 倍超采样后缩小）。"""
+    size_px = max(9, int(size_px))
+    ss = 3
+    n = size_px * ss
+    img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    if kind == "close":
+        d.ellipse([0, 0, n - 1, n - 1], fill=(255, 255, 255, 30))
+        pad = n * 0.33
+        w = max(1, int(round(n * 0.08)))
+        d.line([pad, pad, n - pad, n - pad], fill=(255, 255, 255, 232), width=w)
+        d.line([n - pad, pad, pad, n - pad], fill=(255, 255, 255, 232), width=w)
+    else:
+        w = max(1, int(round(n * 0.07)))
+        for i in range(3):
+            off = 0.20 + i * 0.22
+            d.line([n * off, n * 0.94, n * 0.94, n * off],
+                   fill=(255, 255, 255, 205), width=w)
+    return img.resize((size_px, size_px), Image.LANCZOS)
 
 
 def rounded_panel(size: tuple[int, int], radius: float, fill, border, border_width: float,
@@ -1411,6 +1445,11 @@ class App:
         self._pos_ready = False
         self._dragging = False
         self._drag_off = (0, 0)
+        self._resizing = False
+        self._resize_origin = None
+        self._hover = False
+        self._hover_grip = False
+        self._icon_cache = {}
         self.overlay = None
         self.fps = max(5, min(60, int(cfg.get("fps", 20) or 20)))
 
@@ -1421,6 +1460,7 @@ class App:
         self.vx, self.vy, self.vw, self.vh = virtual_screen()
         self.art = Art(self.scale)
         self.painter = CardPainter(self.art, cfg)
+        self.zoom = self.painter.zoom
         self.snow = Snow(self.vw, self.vh, self.art, cfg.get("snow_density", 1.0))
         self.frame = Image.new("RGBA", (self.vw, self.vh), (0, 0, 0, 0))
         self.card_pos = (0, 0)
@@ -1442,15 +1482,16 @@ class App:
         self.overlay.show()
 
     def _compute_card_pos(self) -> None:
-        s = self.scale
+        s = self.painter.s              # 含用户缩放
+        dpi = self.scale or 1.0         # 位置坐标按 96 DPI 存储，与缩放无关
         rect = work_area()
         w, h = int(round(CardPainter.W * s)), int(round(CardPainter.H * s))
         margin = int(round(float(self.cfg.get("margin", 28)) * s))
         pos = str(self.cfg.get("position", "bottom-right")).lower()
         if pos == "custom" and self.cfg.get("pos_x") is not None and self.cfg.get("pos_y") is not None:
             self.card_pos = self._clamp_card(
-                int(round(float(self.cfg["pos_x"]) * s)) + (rect.left - self.vx),
-                int(round(float(self.cfg["pos_y"]) * s)) + (rect.top - self.vy))
+                int(round(float(self.cfg["pos_x"]) * dpi)) + (rect.left - self.vx),
+                int(round(float(self.cfg["pos_y"]) * dpi)) + (rect.top - self.vy))
             return
         if pos == "custom":
             pos = "bottom-right"
@@ -1587,9 +1628,16 @@ class App:
         if self.toast_text:
             self.dirty = True
 
-        # 卡片透明度：鼠标不在卡片上时保持半透明，移上去/拖动时恢复不透明
+        # 卡片透明度：鼠标不在卡片上时保持半透明，移上去/拖动/缩放时恢复不透明
         idle = max(0.1, min(1.0, float(self.cfg.get("idle_opacity", 0.7))))
-        over = self._dragging or self._cursor_over_card()
+        try:
+            pt = POINT()
+            has_pt = bool(user32.GetCursorPos(ctypes.byref(pt)))
+        except Exception:
+            pt, has_pt = POINT(), False
+        self._hover = has_pt and self._point_over_card(pt.x, pt.y)
+        self._hover_grip = has_pt and self._in_rect(self._grip_screen_rect(), pt.x, pt.y)
+        over = self._dragging or self._resizing or self._hover
         self.card_alpha_target = 1.0 if over else idle
         if abs(self.card_alpha - self.card_alpha_target) > 0.004:
             step = dt * 4.0
@@ -1710,9 +1758,54 @@ class App:
             return False
         return rect[0] <= sx <= rect[2] and rect[1] <= sy <= rect[3]
 
+    @staticmethod
+    def _in_rect(rect, sx: int, sy: int) -> bool:
+        if not rect:
+            return False
+        return rect[0] <= sx <= rect[2] and rect[1] <= sy <= rect[3]
+
+    def _close_screen_rect(self):
+        """卡片右上角关闭按钮的屏幕矩形。"""
+        if not self.card_img:
+            return None
+        s = self.painter.s
+        size = max(13, int(round(18 * s)))
+        x, y = self.card_pos
+        right = x + self.vx + self.card_img.width
+        top = y + self.vy
+        pad = max(3, int(round(5 * s)))
+        return (right - size - pad, top + pad, right - pad, top + pad + size)
+
+    def _grip_screen_rect(self):
+        """卡片右下角缩放手柄的屏幕矩形。"""
+        if not self.card_img:
+            return None
+        size = max(16, int(round(24 * self.painter.s)))
+        x, y = self.card_pos
+        return (x + self.vx + self.card_img.width - size,
+                y + self.vy + self.card_img.height - size,
+                x + self.vx + self.card_img.width,
+                y + self.vy + self.card_img.height)
+
+    def _corner_icon(self, kind: str, size_px: int):
+        key = (kind, size_px)
+        if key not in self._icon_cache:
+            self._icon_cache[key] = make_corner_button(size_px, kind)
+        return self._icon_cache[key]
+
     def _on_mouse(self, event: str, sx: int, sy: int) -> None:
-        """左键按住卡片即可拖动（窗口本身不动，只改卡片坐标）。"""
+        """左键交互：右上角 × 关闭，右下角手柄缩放，卡片其他区域拖动。"""
         if event == "down":
+            if self._in_rect(self._close_screen_rect(), sx, sy):
+                logging.info("点击关闭按钮，退出")
+                self.running = False
+                return
+            if self._in_rect(self._grip_screen_rect(), sx, sy):
+                self._resizing = True
+                self._resize_origin = (sx, sy, self.card_img.width,
+                                       self.painter.zoom, time.time())
+                self.card_alpha = 1.0
+                return
             if self._point_over_card(sx, sy):
                 self._dragging = True
                 self._drag_off = (sx - self.vx - self.card_pos[0],
@@ -1720,16 +1813,71 @@ class App:
                 self.card_alpha = 1.0
             else:
                 self._dragging = False
-        elif event == "move" and self._dragging:
-            nx = sx - self.vx - self._drag_off[0]
-            ny = sy - self.vy - self._drag_off[1]
-            new_pos = self._clamp_card(nx, ny)
-            if new_pos != self.card_pos:
-                self.card_pos = new_pos
-                self.dirty = True
-        elif event == "up" and self._dragging:
-            self._dragging = False
-            self._save_position()
+        elif event == "move":
+            if self._resizing:
+                self._do_resize(sx, sy)
+            elif self._dragging:
+                nx = sx - self.vx - self._drag_off[0]
+                ny = sy - self.vy - self._drag_off[1]
+                new_pos = self._clamp_card(nx, ny)
+                if new_pos != self.card_pos:
+                    self.card_pos = new_pos
+                    self.dirty = True
+        elif event == "up":
+            if self._resizing:
+                self._resizing = False
+                self._resize_origin = None
+                self._save_scale()
+            elif self._dragging:
+                self._dragging = False
+                self._save_position()
+
+    def _do_resize(self, sx: int, sy: int) -> None:
+        if not self._resize_origin:
+            return
+        x0, y0, w0, z0, t0 = self._resize_origin
+        now = time.time()
+        if now - t0 < 0.06:          # 重排卡片较费时，节流到 ~16 次/秒
+            return
+        self._resize_origin = (x0, y0, w0, z0, now)
+        dx = sx - x0
+        target_w = max(160.0, w0 + dx)
+        zoom = z0 * (target_w / max(1.0, float(w0)))
+        zoom = max(0.6, min(2.0, zoom))
+        if abs(zoom - self.painter.zoom) < 0.015:
+            return
+        self._set_zoom(zoom)
+
+    def _set_zoom(self, zoom: float) -> None:
+        self.zoom = max(0.6, min(2.0, zoom))
+        self.painter.set_zoom(self.zoom)
+        self._card_alpha_cache.clear()
+        self._icon_cache.clear()
+        self._request_card()
+        self.card_pos = self._clamp_card(*self.card_pos)
+        self.dirty = True
+
+    def _save_scale(self) -> None:
+        self._update_config({"scale": round(self.painter.zoom, 3)})
+        logging.info("卡片缩放已保存: %.2f", self.painter.zoom)
+
+    def _update_config(self, patch: dict) -> None:
+        """把若干字段合并写回 config.json（保留用户其它设置）。"""
+        try:
+            data = {}
+            if CONFIG_PATH.exists():
+                try:
+                    data = json.loads(CONFIG_PATH.read_text("utf-8"))
+                except Exception:
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data.setdefault("_说明", DEFAULTS["_说明"])
+            data.update(patch)
+            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+            self.cfg.update(patch)
+        except Exception:
+            logging.exception("保存配置失败")
 
     def _save_position(self) -> None:
         """把拖好的位置写回 config.json，下次启动还在原地。"""
@@ -1812,6 +1960,18 @@ class App:
             card, shadow = self._card_with_alpha()
             _blend(frame, shadow, x - pad, y - pad)
             _blend(frame, card, x, y)
+            # 悬停时显示右上角关闭按钮与右下角缩放手柄
+            if self._hover or self._dragging or self._resizing:
+                s = self.painter.s
+                close = self._corner_icon("close", max(13, int(round(18 * s))))
+                _blend(frame, close,
+                       x + self.card_img.width - close.width - max(3, int(round(5 * s))),
+                       y + max(3, int(round(5 * s))))
+                grip_size = max(16, int(round(20 * s)))
+                grip = self._corner_icon("grip", grip_size)
+                _blend(frame, grip,
+                       x + self.card_img.width - grip.width - int(round(4 * s)),
+                       y + self.card_img.height - grip.height - int(round(4 * s)))
         if self.toast_text:
             if self.toast is None:
                 self.toast = (make_pill(self.art, self.toast_text), time.time() + 3.2)
@@ -1862,6 +2022,7 @@ class App:
         self.vx, self.vy, self.vw, self.vh = virtual_screen()
         self.art = Art(self.scale)
         self.painter = CardPainter(self.art, self.cfg)
+        self.painter.set_zoom(self.zoom)
         self.snow = Snow(self.vw, self.vh, self.art, self.cfg.get("snow_density", 1.0))
         self.snow_started = False
         self._pos_ready = False
