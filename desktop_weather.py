@@ -69,6 +69,8 @@ DEFAULTS = {
     "snow_mode": "auto",
     "snow_density": 1.0,
     "position": "bottom-right",
+    "pos_x": None,
+    "pos_y": None,
     "margin": 28,
     "opacity": 0.92,
     "idle_opacity": 0.7,
@@ -84,6 +86,13 @@ WM_DESTROY = 0x0002
 WM_ERASEBKGND = 0x0014
 WM_HOTKEY = 0x0312
 WM_DISPLAYCHANGE = 0x007E
+WM_NCHITTEST = 0x0084
+WM_MOUSEMOVE = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP = 0x0202
+WM_CAPTURECHANGED = 0x0215
+HTCLIENT = 1
+HTTRANSPARENT = -1
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -244,6 +253,9 @@ user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
 user32.GetClassNameW.restype = ctypes.c_int
 user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
 user32.GetAncestor.restype = wt.HWND
+user32.SetCapture.argtypes = [wt.HWND]
+user32.SetCapture.restype = wt.HWND
+user32.ReleaseCapture.restype = wt.BOOL
 user32.RegisterWindowMessageW.argtypes = [wt.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wt.UINT
 user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
@@ -380,10 +392,13 @@ class Overlay:
     _class_registered = False
 
     def __init__(self, x: int, y: int, w: int, h: int, hotkey_cb, display_cb, command_cb=None,
-                 on_desktop: bool = True):
+                 on_desktop: bool = True, hit_test_cb=None, mouse_cb=None):
         self.hotkey_cb = hotkey_cb
         self.display_cb = display_cb
         self.command_cb = command_cb
+        self.hit_test_cb = hit_test_cb      # (screen_x, screen_y) -> 是否落在卡片上
+        self.mouse_cb = mouse_cb            # ("down"/"move"/"up", screen_x, screen_y)
+        self.dragging = False
         self.on_desktop = on_desktop
         self.hwnd = None
         self.screen_dc = None
@@ -406,8 +421,9 @@ class Overlay:
                     raise ctypes.WinError(err)
             Overlay._class_registered = True
 
-        ex_style = (WS_EX_LAYERED | WS_EX_TRANSPARENT |
-                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+        # 注意：这里不能带 WS_EX_TRANSPARENT —— 否则收不到鼠标消息，卡片就没法拖动。
+        # 穿透改由 WM_NCHITTEST 逐点判断：卡片上返回 HTCLIENT，其余区域返回 HTTRANSPARENT。
+        ex_style = (WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
         if not on_desktop:
             ex_style |= WS_EX_TOPMOST
         self.hwnd = user32.CreateWindowExW(ex_style, self._class_name, "DesktopWeather",
@@ -439,8 +455,45 @@ class Overlay:
         self.msg = MSG()
 
     # -- 窗口过程 ---------------------------------------------------------------
+    @staticmethod
+    def _unpack(lparam):
+        return (ctypes.c_short(lparam & 0xFFFF).value,
+                ctypes.c_short((lparam >> 16) & 0xFFFF).value)
+
     def _wndproc(self, hwnd, msg, wparam, lparam):
         try:
+            if msg == WM_NCHITTEST:
+                sx, sy = self._unpack(lparam)          # 屏幕坐标
+                try:
+                    if self.hit_test_cb and self.hit_test_cb(sx, sy):
+                        return HTCLIENT
+                except Exception:
+                    logging.exception("命中测试失败")
+                return HTTRANSPARENT
+            if msg in (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE):
+                cx, cy = self._unpack(lparam)          # 客户区坐标
+                sx, sy = cx + self.pt_dst.x, cy + self.pt_dst.y
+                if msg == WM_LBUTTONDOWN:
+                    self.dragging = True
+                    user32.SetCapture(hwnd)
+                    if self.mouse_cb:
+                        self.mouse_cb("down", sx, sy)
+                    return 0
+                if msg == WM_MOUSEMOVE:
+                    if self.dragging and self.mouse_cb:
+                        self.mouse_cb("move", sx, sy)
+                    return 0
+                self.dragging = False
+                user32.ReleaseCapture()
+                if self.mouse_cb:
+                    self.mouse_cb("up", sx, sy)
+                return 0
+            if msg == WM_CAPTURECHANGED:
+                if self.dragging:
+                    self.dragging = False
+                    if self.mouse_cb:
+                        self.mouse_cb("up", -1, -1)
+                return 0
             if msg == WM_HOTKEY:
                 if self.hotkey_cb:
                     self.hotkey_cb(int(wparam))
@@ -1263,6 +1316,9 @@ class App:
         self.z_mode = None
         self._last_top_assert = 0.0
         self.dirty = True
+        self._pos_ready = False
+        self._dragging = False
+        self._drag_off = (0, 0)
         self.overlay = None
         self.fps = max(5, min(60, int(cfg.get("fps", 20) or 20)))
 
@@ -1287,7 +1343,9 @@ class App:
             self.overlay.destroy()
         self.overlay = Overlay(self.vx, self.vy, self.vw, self.vh,
                                self.on_hotkey, self.on_display_change, self.on_command,
-                               on_desktop=bool(self.cfg.get("on_desktop", True)))
+                               on_desktop=bool(self.cfg.get("on_desktop", True)),
+                               hit_test_cb=self._point_over_card,
+                               mouse_cb=self._on_mouse)
         self.overlay.register_hotkeys()
         self.overlay.show()
 
@@ -1297,6 +1355,13 @@ class App:
         w, h = int(round(CardPainter.W * s)), int(round(CardPainter.H * s))
         margin = int(round(float(self.cfg.get("margin", 28)) * s))
         pos = str(self.cfg.get("position", "bottom-right")).lower()
+        if pos == "custom" and self.cfg.get("pos_x") is not None and self.cfg.get("pos_y") is not None:
+            self.card_pos = self._clamp_card(
+                int(round(float(self.cfg["pos_x"]) * s)) + (rect.left - self.vx),
+                int(round(float(self.cfg["pos_y"]) * s)) + (rect.top - self.vy))
+            return
+        if pos == "custom":
+            pos = "bottom-right"
         left = rect.left - self.vx + margin
         top = rect.top - self.vy + margin
         right = rect.right - self.vx - margin - w
@@ -1304,6 +1369,18 @@ class App:
         x = right if "right" in pos else left
         y = bottom if "bottom" in pos else top
         self.card_pos = (int(x), int(y))
+
+    def _clamp_card(self, x: float, y: float) -> tuple[int, int]:
+        """把卡片限制在工作区内，拖到哪都不会跑丢。"""
+        rect = work_area()
+        if not self.card_img:
+            return int(x), int(y)
+        w, h = self.card_img.size
+        left = rect.left - self.vx + 4
+        top = rect.top - self.vy + 4
+        right = rect.right - self.vx - w - 4
+        bottom = rect.bottom - self.vy - h - 4
+        return int(max(left, min(right, x))), int(max(top, min(bottom, y)))
 
     def _request_card(self) -> None:
         self.card_key = None
@@ -1317,7 +1394,9 @@ class App:
         self.card_key = key
         self.card_img, self.card_shadow, self.card_pad = self.painter.draw(data, snowy)
         self._card_alpha_cache = {}
-        self._compute_card_pos()
+        if not self._pos_ready:
+            self._compute_card_pos()
+            self._pos_ready = True
         return True
 
     # -- 状态 ------------------------------------------------------------------
@@ -1416,9 +1495,10 @@ class App:
         if self.toast_text:
             self.dirty = True
 
-        # 卡片透明度：鼠标不在卡片上时保持半透明，移上去恢复不透明
+        # 卡片透明度：鼠标不在卡片上时保持半透明，移上去/拖动时恢复不透明
         idle = max(0.1, min(1.0, float(self.cfg.get("idle_opacity", 0.7))))
-        self.card_alpha_target = 1.0 if self._cursor_over_card() else idle
+        over = self._dragging or self._cursor_over_card()
+        self.card_alpha_target = 1.0 if over else idle
         if abs(self.card_alpha - self.card_alpha_target) > 0.004:
             step = dt * 4.0
             self.card_alpha += max(-step, min(step, self.card_alpha_target - self.card_alpha))
@@ -1518,11 +1598,71 @@ class App:
                 return False
         except Exception:
             return False
+        return self._point_over_card(pt.x, pt.y)
+
+    def _card_screen_rect(self):
+        """卡片在屏幕坐标下的矩形（含少量边距）。"""
+        if not self.card_img:
+            return None
         x, y = self.card_pos
-        sx, sy = pt.x - self.vx, pt.y - self.vy
-        pad = int(8 * self.scale)
-        return (x - pad <= sx <= x + self.card_img.width + pad
-                and y - pad <= sy <= y + self.card_img.height + pad)
+        pad = int(4 * self.scale)
+        return (x + self.vx - pad, y + self.vy - pad,
+                x + self.vx + self.card_img.width + pad,
+                y + self.vy + self.card_img.height + pad)
+
+    def _point_over_card(self, sx: int, sy: int) -> bool:
+        if not self.show_card:
+            return False
+        rect = self._card_screen_rect()
+        if rect is None:
+            return False
+        return rect[0] <= sx <= rect[2] and rect[1] <= sy <= rect[3]
+
+    def _on_mouse(self, event: str, sx: int, sy: int) -> None:
+        """左键按住卡片即可拖动（窗口本身不动，只改卡片坐标）。"""
+        if event == "down":
+            if self._point_over_card(sx, sy):
+                self._dragging = True
+                self._drag_off = (sx - self.vx - self.card_pos[0],
+                                  sy - self.vy - self.card_pos[1])
+                self.card_alpha = 1.0
+            else:
+                self._dragging = False
+        elif event == "move" and self._dragging:
+            nx = sx - self.vx - self._drag_off[0]
+            ny = sy - self.vy - self._drag_off[1]
+            new_pos = self._clamp_card(nx, ny)
+            if new_pos != self.card_pos:
+                self.card_pos = new_pos
+                self.dirty = True
+        elif event == "up" and self._dragging:
+            self._dragging = False
+            self._save_position()
+
+    def _save_position(self) -> None:
+        """把拖好的位置写回 config.json，下次启动还在原地。"""
+        try:
+            rect = work_area()
+            s = self.scale or 1.0
+            data = {}
+            if CONFIG_PATH.exists():
+                try:
+                    data = json.loads(CONFIG_PATH.read_text("utf-8"))
+                except Exception:
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data.setdefault("_说明", DEFAULTS["_说明"])
+            data["position"] = "custom"
+            data["pos_x"] = round((self.card_pos[0] - (rect.left - self.vx)) / s, 1)
+            data["pos_y"] = round((self.card_pos[1] - (rect.top - self.vy)) / s, 1)
+            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+            self.cfg["position"] = "custom"
+            self.cfg["pos_x"] = data["pos_x"]
+            self.cfg["pos_y"] = data["pos_y"]
+            logging.info("卡片位置已保存: %s, %s", data["pos_x"], data["pos_y"])
+        except Exception:
+            logging.exception("保存卡片位置失败")
 
     def _card_with_alpha(self):
         """按当前卡片透明度返回（可能缓存的）卡片和阴影图像。"""
@@ -1632,6 +1772,7 @@ class App:
         self.painter = CardPainter(self.art, self.cfg)
         self.snow = Snow(self.vw, self.vh, self.art, self.cfg.get("snow_density", 1.0))
         self.snow_started = False
+        self._pos_ready = False
         self.frame = Image.new("RGBA", (self.vw, self.vh), (0, 0, 0, 0))
         self._create_overlay()
         self._request_card()
