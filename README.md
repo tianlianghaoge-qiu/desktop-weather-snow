@@ -175,7 +175,7 @@ pip install pillow
 | `scale` | number | `1.0` | 卡片缩放比例，范围 0.6 ~ 2.0；拖动右下角手柄自动写入 |
 | `theme` | string | `"auto"` | `auto` 按月份切换；也可锁定 `spring` / `summer` / `autumn` / `winter` |
 | `on_desktop` | bool | `true` | `true` 位于桌面层不遮挡窗口；`false` 改为置顶悬浮 |
-| `fps` | number | `60` | 渲染帧率，同时决定层级检查频率；受全屏合成限制，实测上限约 45 |
+| `fps` | number | `60` | 渲染帧率，同时决定层级检查频率 |
 | `auto_hide` | bool | `false` | 置顶模式下的自动隐藏开关 |
 | `show_card` | bool | `true` | 是否显示天气卡片 |
 | `refresh_minutes` | number | `10` | 天气刷新间隔（分钟） |
@@ -188,8 +188,13 @@ pip install pillow
 
 ## 实现原理
 
-- **透明浮层**：`WS_EX_LAYERED` 分层窗口配合 `UpdateLayeredWindow`，Pillow 渲染预乘 alpha 的
-  BGRA 位图并提交给 DWM，每帧一次全屏合成。
+- **透明浮层**：`WS_EX_LAYERED` 分层窗口配合 `UpdateLayeredWindow`，把一块预乘 alpha 的 BGRA
+  位图提交给 DWM 合成。
+- **GDI 直接合成**：雪花与卡片不再由 Pillow 拼成整屏位图，而是用 `AlphaBlend` 直接绘制到窗口的
+  32 位 DIB 上。`AlphaBlend` 的 `dst = src + dst × (1 − srcA)` 正是预乘 alpha 的 over 合成，
+  因此省掉了每帧「整幅位图预乘转换 + 12.5 MB 拷贝」这两项固定开销（合计约 15 ms）。
+  整屏 2240×1400、243 片雪花时单帧约 9.3 ms（清屏 0.4 + 雪花 2.9 + 卡片 0.4 + 提交 3.5），
+  对应 60 帧下单核约 50%。若 GDI 初始化失败，会自动退回整帧 Pillow 渲染。
 - **桌面层定位**：不使用 `WS_EX_TOPMOST`，通过 `SetWindowPos(HWND_BOTTOM)` 沉底，窗口最终位于
   `Progman` 之上、所有普通窗口之下；桌面完全露出时临时置顶，避免被桌面层覆盖。
 - **点击穿透**：由 `WM_NCHITTEST` 逐点判定 —— 卡片区域返回 `HTCLIENT`（可点击、可拖动），其余区域
@@ -228,8 +233,8 @@ pip install pillow
 
 ### CPU 占用偏高
 
-全屏飘雪时约占用单核 40%。可降低 `fps`（建议 12 ~ 15）或 `snow_density`。程序被窗口完全遮挡时
-会暂停渲染。
+全屏飘雪、60 帧时约占用单核 50%。可降低 `fps`（30 帧约 25%）或 `snow_density`。程序被窗口
+完全遮挡时会暂停渲染。
 
 ### 提示缺少 Python 或 Pillow
 
@@ -242,7 +247,7 @@ pip install pillow
 
 | 版本 | 主要变更 |
 | --- | --- |
-| v1.3.0 | 详情视图（24 小时温度曲线 + 详细指标）、右键城市菜单 |
+| v1.3.0 | 详情视图（24 小时温度曲线 + 详细指标）、右键城市菜单、GDI 直接合成（60 帧，单核约 50%） |
 | v1.2.0 | 四季主题 UI、卡片尺寸调节、右上角关闭按钮、默认帧率提升至 60、桌面右键菜单不再导致卡片消失 |
 | v1.1.1 | 天气源自动降级（Open-Meteo → wttr.in），缩短超时与重试间隔 |
 | v1.1.0 | 桌面层常驻、卡片拖放定位、悬停半透明、显示桌面时不再消失 |
