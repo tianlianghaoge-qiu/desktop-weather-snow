@@ -1,5 +1,5 @@
 {
-  "_说明": "复制为 config.json 后生效。city 留空则自动定位；snow_threshold 为飘雪温度阈值（摄氏度）；snow_mode: auto/on/off",
+  "_说明": "复制为 config.json 后生效。city 留空则自动定位；snow_threshold 为飘雪温度阈值（摄氏度）；snow_mode: auto/on/off；on_desktop=true 表示贴在桌面最底层，不遮挡任何窗口",
   "city": "",
   "snow_threshold": 3.0,
   "snow_mode": "auto",
@@ -7,6 +7,8 @@
   "position": "bottom-right",
   "margin": 28,
   "opacity": 0.92,
+  "idle_opacity": 0.7,
+  "on_desktop": true,
   "fps": 20,
   "auto_hide": false,
   "show_card": true,

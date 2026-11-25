@@ -13,6 +13,8 @@
 
 ## 特性
 
+- **桌面最底层**：窗口贴在壁纸之上、所有窗口之下，永远不会遮挡任何程序；点开任何窗口它就被盖住
+- **鼠标靠近才清晰**：鼠标不在卡片上时保持 ~70% 透明度，移上去自动变清晰
 - **透明浮层**：Win32 分层窗口逐像素 alpha 合成，圆角、阴影、磨砂玻璃质感
 - **鼠标点击穿透**：雪花和卡片都不会挡住任何操作，不抢焦点、不进 Alt+Tab
 - **实时天气**：当前温度、体感、天气状况、今日最高/最低、湿度、风向风速
@@ -20,7 +22,7 @@
 - **低温飘雪**：气温 ≤ 阈值（默认 3°C）时全屏飘雪，越冷雪越大；雪天天气也会触发
 - **真实风向**：雪花按当前风向漂移，带阵风、摇摆和景深虚化，并带极淡投影（浅色窗口上也看得见）
 - **高 DPI 友好**：Per-Monitor V2 感知，150% 缩放下文字依然清晰
-- **省电**：不飘雪时降到 1 FPS，几乎不占 CPU
+- **省电**：被窗口盖住 / 不飘雪时自动降到 1 FPS，几乎不占 CPU
 
 ---
 
@@ -69,6 +71,19 @@ pip install pillow
 
 ---
 
+## 层级与透明度
+
+程序默认以**桌面级最低优先级**运行（`"on_desktop": true`）：
+
+- 窗口被沉到所有普通窗口之下，正好落在桌面图标层之上 —— 打开任何程序，它都会被盖住，**永远不会遮挡别的窗口**
+- 点一下桌面（或 `Win + D`）就能重新看到它
+- 鼠标不在卡片上时保持 **70% 透明度**（`idle_opacity`），鼠标移上去自动变清晰
+- 被窗口完全盖住时会自动停止渲染，CPU 占用接近 0
+
+如果希望它像普通悬浮窗一样永远置顶，把 `on_desktop` 改成 `false` 即可。
+
+---
+
 ## 温度与雪花
 
 默认 **≤ 3°C** 开始飘雪，越冷雪越大：
@@ -96,6 +111,8 @@ pip install pillow
   "position": "bottom-right",
   "margin": 28,
   "opacity": 0.92,
+  "idle_opacity": 0.7,
+  "on_desktop": true,
   "fps": 20,
   "auto_hide": false,
   "show_card": true,
@@ -111,9 +128,11 @@ pip install pillow
 | `snow_density` | 雪量倍率，`0.5` 稀疏，`2.0` 暴雪 |
 | `position` | `bottom-right` / `bottom-left` / `top-right` / `top-left` |
 | `margin` | 卡片距屏幕边缘的像素（按 96 DPI 计，随缩放自动放大） |
-| `opacity` | 卡片不透明度 0~1 |
+| `opacity` | 卡片底色不透明度 0~1 |
+| `idle_opacity` | 鼠标不在卡片上时的不透明度，默认 `0.7`；设 `1` 可关闭淡出 |
+| `on_desktop` | `true`（默认）贴在桌面最底层不遮挡窗口；`false` 改为置顶悬浮 |
 | `fps` | 帧率，默认 20；调低更省电，调高更顺滑 |
-| `auto_hide` | `true` 时有窗口最大化/全屏就自动隐藏（只在桌面可见） |
+| `auto_hide` | 置顶模式下的自动隐藏开关（桌面模式下不需要） |
 | `show_card` | 是否显示天气卡片 |
 | `refresh_minutes` | 天气刷新间隔（分钟） |
 
@@ -128,6 +147,9 @@ pip install pillow
 
 - **透明浮层**：`WS_EX_LAYERED` 分层窗口 + `UpdateLayeredWindow`，Pillow 直接渲染出预乘 alpha 的
   BGRA 位图推给 DWM，一帧一次全屏合成。
+- **桌面最底层**：去掉 `WS_EX_TOPMOST`，用 `SetWindowPos(HWND_BOTTOM)` 沉底，并在
+  `WM_WINDOWPOSCHANGING` 里把任何 Z 序调整强制改回底部 —— 窗口最终正好压在 `Progman`（桌面）之上、
+  所有普通窗口之下，所以既不遮挡程序，又能显示在壁纸上。
 - **点击穿透**：`WS_EX_TRANSPARENT`；不抢焦点：`WS_EX_NOACTIVATE`；不进 Alt+Tab：`WS_EX_TOOLWINDOW`。
 - **DPI**：`SetProcessDpiAwarenessContext(-4)`（Per-Monitor V2），按物理像素绘制。
 - **天气**：`api.open-meteo.com`（当前温度 / 体感 / 天气代码 / 风向风速 / 今日最高最低）。
@@ -142,13 +164,20 @@ pip install pillow
 **提示找不到 Python / 没有 Pillow**
 安装 Python 3.9+，命令行执行 `pip install pillow` 后重试。
 
-**卡片出现了，但桌面没有雪**
+**看不到卡片 / 雪花？**
+这是默认行为 —— 它在桌面最底层，被任何窗口盖住时就看不见。
+最小化窗口或按 `Win + D` 显示桌面即可看到。想让它永远置顶，把 `on_desktop` 改成 `false`。
+
+**卡片好像变淡了？**
+鼠标不在卡片上时是 70% 透明，移上去会变清晰。把 `idle_opacity` 设为 `1` 可关闭这个效果。
+
+**桌面没有雪**
 当前气温高于阈值（默认 3°C）。按 `Ctrl+Alt+S` 或双击 `预览飘雪效果.vbs` 预览。
 另外雪花是白色的，在**纯白网页/窗口**上会比较淡——看桌面壁纸区域最清楚。
 
 **CPU 有点高**
 飘雪时约占用一个 CPU 核心的 40%（全屏 2240×1400 逐帧合成）。把 `fps` 调成 12~15，
-或减小 `snow_density`，或设置 `auto_hide: true`（只在桌面时渲染）。
+或减小 `snow_density`。被窗口盖住时会自动停止渲染，平时几乎不耗电。
 
 **想换个角落**
 改 `position` 和 `margin`，重启程序。

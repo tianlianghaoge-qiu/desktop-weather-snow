@@ -71,6 +71,8 @@ DEFAULTS = {
     "position": "bottom-right",
     "margin": 28,
     "opacity": 0.92,
+    "idle_opacity": 0.7,
+    "on_desktop": True,
     "fps": 20,
     "auto_hide": False,
     "show_card": True,
@@ -234,6 +236,14 @@ user32.SystemParametersInfoW.restype = wt.BOOL
 user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
                                 ctypes.c_int, ctypes.c_int, wt.UINT]
 user32.SetWindowPos.restype = wt.BOOL
+user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+user32.GetCursorPos.restype = wt.BOOL
+user32.WindowFromPoint.argtypes = [POINT]
+user32.WindowFromPoint.restype = wt.HWND
+user32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+user32.GetAncestor.restype = wt.HWND
 user32.RegisterWindowMessageW.argtypes = [wt.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wt.UINT
 user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
@@ -283,6 +293,11 @@ AC_SRC_ALPHA = 1
 BI_RGB = 0
 DIB_RGB_COLORS = 0
 HWND_TOPMOST = -1
+HWND_BOTTOM = 1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
 SPI_GETWORKAREA = 0x0030
 SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
 SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
@@ -337,16 +352,39 @@ def work_area() -> RECT:
     return rect
 
 
+DESKTOP_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+                   "Windows.UI.Core.CoreWindow"}
+
+
+def window_class(hwnd) -> str:
+    if not hwnd:
+        return ""
+    buf = ctypes.create_unicode_buffer(128)
+    user32.GetClassNameW(hwnd, buf, 128)
+    return buf.value
+
+
+def root_class(hwnd) -> str:
+    """取顶层祖先的类名（命中测试往往返回桌面图标之类的子窗口）。"""
+    try:
+        root = user32.GetAncestor(hwnd, 2) or hwnd   # GA_ROOT
+    except Exception:
+        root = hwnd
+    return window_class(root)
+
+
 class Overlay:
     """一个 WS_EX_LAYERED 的全屏浮层：逐像素透明、鼠标穿透、永不被激活。"""
 
     _class_name = "DesktopWeatherOverlay"
     _class_registered = False
 
-    def __init__(self, x: int, y: int, w: int, h: int, hotkey_cb, display_cb, command_cb=None):
+    def __init__(self, x: int, y: int, w: int, h: int, hotkey_cb, display_cb, command_cb=None,
+                 on_desktop: bool = True):
         self.hotkey_cb = hotkey_cb
         self.display_cb = display_cb
         self.command_cb = command_cb
+        self.on_desktop = on_desktop
         self.hwnd = None
         self.screen_dc = None
         self.mem_dc = None
@@ -368,8 +406,10 @@ class Overlay:
                     raise ctypes.WinError(err)
             Overlay._class_registered = True
 
-        ex_style = (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
+        ex_style = (WS_EX_LAYERED | WS_EX_TRANSPARENT |
                     WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+        if not on_desktop:
+            ex_style |= WS_EX_TOPMOST
         self.hwnd = user32.CreateWindowExW(ex_style, self._class_name, "DesktopWeather",
                                            WS_POPUP, x, y, w, h, None, None, hinst, None)
         if not self.hwnd:
@@ -433,7 +473,13 @@ class Overlay:
 
     def show(self) -> None:
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
-        user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+        if self.on_desktop:
+            # 沉到所有普通窗口之下（正好落在桌面 Progman 之上）
+            user32.SetWindowPos(self.hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+        else:
+            user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
 
     def pump(self) -> None:
         while user32.PeekMessageW(ctypes.byref(self.msg), None, 0, 0, 1):
@@ -1209,6 +1255,14 @@ class App:
         self.snow_started = False
         self.alpha = 1.0
         self.alpha_target = 1.0
+        self.card_alpha = 1.0
+        self.card_alpha_target = 1.0
+        self._card_alpha_cache = {}
+        self.covered = False
+        self._last_cover_check = 0.0
+        self.z_mode = None
+        self._last_top_assert = 0.0
+        self.dirty = True
         self.overlay = None
         self.fps = max(5, min(60, int(cfg.get("fps", 20) or 20)))
 
@@ -1232,7 +1286,8 @@ class App:
         if self.overlay:
             self.overlay.destroy()
         self.overlay = Overlay(self.vx, self.vy, self.vw, self.vh,
-                               self.on_hotkey, self.on_display_change, self.on_command)
+                               self.on_hotkey, self.on_display_change, self.on_command,
+                               on_desktop=bool(self.cfg.get("on_desktop", True)))
         self.overlay.register_hotkeys()
         self.overlay.show()
 
@@ -1253,15 +1308,17 @@ class App:
     def _request_card(self) -> None:
         self.card_key = None
 
-    def _rebuild_card(self) -> None:
+    def _rebuild_card(self) -> bool:
         data = self.data
         snowy = self.snow.target > 0.02
         key = (id(data), data.get("stamp") if data else None, snowy)
         if key == self.card_key and self.card_img is not None:
-            return
+            return False
         self.card_key = key
         self.card_img, self.card_shadow, self.card_pad = self.painter.draw(data, snowy)
+        self._card_alpha_cache = {}
         self._compute_card_pos()
+        return True
 
     # -- 状态 ------------------------------------------------------------------
     def snow_intensity(self) -> float:
@@ -1336,6 +1393,8 @@ class App:
         else:
             self.snow.wind = 0.0
         self.snow.update(dt)
+        if self.snow.flakes:
+            self.dirty = True
 
         # 淡入淡出（auto_hide）
         if self.cfg.get("auto_hide") and not self.headless:
@@ -1346,35 +1405,169 @@ class App:
         if abs(self.alpha - self.alpha_target) > 0.005:
             step = dt * 3.5
             self.alpha += max(-step, min(step, self.alpha_target - self.alpha))
+            self.dirty = True
         else:
             self.alpha = self.alpha_target
 
         if self.toast and time.time() > self.toast[1]:
             self.toast = None
             self.toast_text = ""
+            self.dirty = True
+        if self.toast_text:
+            self.dirty = True
 
-        self._rebuild_card()
+        # 卡片透明度：鼠标不在卡片上时保持半透明，移上去恢复不透明
+        idle = max(0.1, min(1.0, float(self.cfg.get("idle_opacity", 0.7))))
+        self.card_alpha_target = 1.0 if self._cursor_over_card() else idle
+        if abs(self.card_alpha - self.card_alpha_target) > 0.004:
+            step = dt * 4.0
+            self.card_alpha += max(-step, min(step, self.card_alpha_target - self.card_alpha))
+            self.dirty = True
+        else:
+            self.card_alpha = self.card_alpha_target
 
-    def _foreground_covers_screen(self) -> bool:
+        # 每个 tick 都复查桌面露出情况并维护层级：切窗口时立刻让位，不会有滞后感
+        if self.cfg.get("on_desktop", True) and not self.headless:
+            now = time.perf_counter()
+            if now - self._last_cover_check >= 0.03:
+                self._last_cover_check = now
+                ratio = self._desktop_visible_ratio()
+                was_covered = self.covered
+                self.covered = ratio < 0.12
+                if self.covered != was_covered:
+                    self.dirty = True
+                self._apply_zorder(ratio)
+        else:
+            self.covered = False
+
+        if self._rebuild_card():
+            self.dirty = True
+
+    def _apply_zorder(self, ratio: float) -> None:
+        """平时沉到所有窗口之下；桌面完全露出（Win+D / 只剩桌面）时才置顶，且每次检查都重新置顶，
+        防止桌面窗口被激活后反把我们盖住。"""
+        if not self.overlay or not self.overlay.hwnd:
+            return
+        want = "top" if ratio >= 0.97 else "bottom"
+        now = time.perf_counter()
+        try:
+            if want == "top":
+                # 桌面完全露出时用置顶保证可见；不用每次都设，隔 0.4s 重申一次即可
+                if self.z_mode != "top" or now - self._last_top_assert >= 0.4:
+                    self._last_top_assert = now
+                    user32.SetWindowPos(self.overlay.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                        SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+            elif self.z_mode != "bottom":
+                user32.SetWindowPos(self.overlay.hwnd, -2, 0, 0, 0, 0,   # HWND_NOTOPMOST
+                                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+                user32.SetWindowPos(self.overlay.hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+        except Exception:
+            logging.exception("调整窗口层级失败")
+        if want != self.z_mode:
+            logging.info("z-order -> %s (desktop ratio %.2f)", want, ratio)
+            self.z_mode = want
+            self.dirty = True          # 层级变了，立刻重绘一帧
+
+    def _desktop_visible_ratio(self) -> float:
+        """采样工作区内的点，估算“桌面还露出多少”。
+        命中自己（穿透）、桌面类窗口、以及很小的浮窗（输入法状态条/提示）都算可见。"""
+        if not self.overlay:
+            return 1.0
+        wa = work_area()
+        wa_area = max(1, (wa.right - wa.left) * (wa.bottom - wa.top))
+        cols, rows = 8, 5
+        seen = 0
+        total = 0
+        small_cache = {}
+        for i in range(cols):
+            x = wa.left + int((i + 0.5) * (wa.right - wa.left) / cols)
+            for j in range(rows):
+                y = wa.top + int((j + 0.5) * (wa.bottom - wa.top) / rows)
+                total += 1
+                try:
+                    h = user32.WindowFromPoint(POINT(x, y))
+                except Exception:
+                    seen += 1
+                    continue
+                if not h or h == self.overlay.hwnd:
+                    seen += 1
+                    continue
+                root = user32.GetAncestor(h, 2) or h
+                if window_class(root) in DESKTOP_CLASSES:
+                    seen += 1
+                    continue
+                area = small_cache.get(root)
+                if area is None:
+                    r = RECT()
+                    if user32.GetWindowRect(root, ctypes.byref(r)):
+                        area = (r.right - r.left) * (r.bottom - r.top)
+                    else:
+                        area = wa_area
+                    small_cache[root] = area
+                if area < wa_area * 0.04:      # 输入法条、提示气泡之类的小浮窗不算遮挡
+                    seen += 1
+        return seen / max(1, total)
+
+    def _cursor_over_card(self) -> bool:
+        if not self.show_card or self.card_img is None:
+            return False
+        try:
+            pt = POINT()
+            if not user32.GetCursorPos(ctypes.byref(pt)):
+                return False
+        except Exception:
+            return False
+        x, y = self.card_pos
+        sx, sy = pt.x - self.vx, pt.y - self.vy
+        pad = int(8 * self.scale)
+        return (x - pad <= sx <= x + self.card_img.width + pad
+                and y - pad <= sy <= y + self.card_img.height + pad)
+
+    def _card_with_alpha(self):
+        """按当前卡片透明度返回（可能缓存的）卡片和阴影图像。"""
+        level = int(round(self.card_alpha * 20))
+        if level >= 20:
+            return self.card_img, self.card_shadow
+        key = (level, id(self.card_img))
+        cached = self._card_alpha_cache.get(key)
+        if cached is None:
+            factor = max(0, level) / 20.0
+            img = self.card_img.copy()
+            img.putalpha(self.card_img.getchannel("A").point(lambda v: int(v * factor)))
+            shadow = self.card_shadow.copy()
+            shadow.putalpha(self.card_shadow.getchannel("A").point(lambda v: int(v * factor)))
+            cached = (img, shadow)
+            self._card_alpha_cache = {key: cached}
+        return cached
+
+    def _foreground_covers_screen(self, ratio: float = 0.90) -> bool:
         try:
             hwnd = user32.GetForegroundWindow()
             if not hwnd or user32.IsIconic(hwnd):
                 return False
+            if self.overlay and hwnd == self.overlay.hwnd:
+                return False
             rect = RECT()
             if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 return False
+            wa = work_area()
             area = (rect.right - rect.left) * (rect.bottom - rect.top)
-            return area >= self.vw * self.vh * 0.90
+            wa_area = max(1, (wa.right - wa.left) * (wa.bottom - wa.top))
+            return area >= wa_area * ratio
         except Exception:
             return False
 
     @property
     def animating(self) -> bool:
+        if self.covered:
+            return False
         if self.alpha <= 0.01 and self.alpha_target <= 0.01:
             return False
         return (bool(self.snow.flakes) or self.snow.target > 0
                 or self.toast is not None
-                or abs(self.alpha - self.alpha_target) > 0.01)
+                or abs(self.alpha - self.alpha_target) > 0.01
+                or abs(self.card_alpha - self.card_alpha_target) > 0.01)
 
     def render(self) -> Image.Image:
         frame = self.frame
@@ -1384,8 +1577,9 @@ class App:
         if self.show_card and self.card_img is not None:
             x, y = self.card_pos
             pad = self.card_pad
-            _blend(frame, self.card_shadow, x - pad, y - pad)
-            _blend(frame, self.card_img, x, y)
+            card, shadow = self._card_with_alpha()
+            _blend(frame, shadow, x - pad, y - pad)
+            _blend(frame, card, x, y)
         if self.toast_text:
             if self.toast is None:
                 self.toast = (make_pill(self.art, self.toast_text), time.time() + 3.2)
@@ -1406,6 +1600,8 @@ class App:
 
     def run(self) -> None:
         target = 1.0 / self.fps
+        # 桌面模式下即使静止也要以帧率跑状态机（层级检查），但只有内容变化时才真正重绘
+        desktop_mode = bool(self.cfg.get("on_desktop", True)) and not self.headless
         last = time.perf_counter()
         next_frame = last
         while self.running:
@@ -1417,10 +1613,12 @@ class App:
                 dt = min(0.15, max(0.001, now - last))
                 last = now
                 self.update(dt)
-                if self.alpha > 0.01:
+                if self.dirty and not self.covered and self.alpha > 0.01:
                     frame = self.render()
                     self.overlay.blit(frame, int(255 * self.alpha))
-                next_frame = now + (target if self.animating else 1.0)
+                    self.dirty = False
+                busy = self.animating or desktop_mode
+                next_frame = now + (target if busy else 1.0)
             else:
                 time.sleep(min(0.008, max(0.001, next_frame - now)))
         self.shutdown()
