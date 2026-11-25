@@ -1565,6 +1565,8 @@ class App:
         self._drag_off = (0, 0)
         self._resizing = False
         self._resize_origin = None
+        self._preview_zoom = 1.0
+        self._clamp_pending = False
         self._hover = False
         self._hover_grip = False
         self._icon_cache = {}
@@ -1652,6 +1654,9 @@ class App:
         if not self._pos_ready:
             self._compute_card_pos()
             self._pos_ready = True
+        elif self._clamp_pending:
+            self.card_pos = self._clamp_card(*self.card_pos)
+        self._clamp_pending = False
         return True
 
     # -- 状态 ------------------------------------------------------------------
@@ -1929,6 +1934,7 @@ class App:
                 return
             if self._in_rect(self._grip_screen_rect(), sx, sy):
                 self._resizing = True
+                self._preview_zoom = self.painter.zoom
                 self._resize_origin = (sx, sy, self.card_img.width,
                                        self.painter.zoom, time.time())
                 self.card_alpha = 1.0
@@ -1954,6 +1960,8 @@ class App:
             if self._resizing:
                 self._resizing = False
                 self._resize_origin = None
+                # 松手才真正重建卡片（一次约 60~120ms），拖动期间用位图缩放保证流畅
+                self._set_zoom(self._preview_zoom)
                 self._save_scale()
             elif self._dragging:
                 self._dragging = False
@@ -1963,17 +1971,13 @@ class App:
         if not self._resize_origin:
             return
         x0, y0, w0, z0, t0 = self._resize_origin
-        now = time.time()
-        if now - t0 < 0.06:          # 重排卡片较费时，节流到 ~16 次/秒
-            return
-        self._resize_origin = (x0, y0, w0, z0, now)
         dx = sx - x0
         target_w = max(160.0, w0 + dx)
-        zoom = z0 * (target_w / max(1.0, float(w0)))
-        zoom = max(0.6, min(2.0, zoom))
-        if abs(zoom - self.painter.zoom) < 0.015:
+        zoom = max(0.6, min(2.0, z0 * (target_w / max(1.0, float(w0)))))
+        if abs(zoom - self._preview_zoom) < 0.004:
             return
-        self._set_zoom(zoom)
+        self._preview_zoom = zoom
+        self.dirty = True
 
     def _set_zoom(self, zoom: float) -> None:
         self.zoom = max(0.6, min(2.0, zoom))
@@ -1981,7 +1985,8 @@ class App:
         self._card_alpha_cache.clear()
         self._icon_cache.clear()
         self._request_card()
-        self.card_pos = self._clamp_card(*self.card_pos)
+        self._clamp_pending = True          # 新尺寸下重新夹取位置
+        self._preview_zoom = self.zoom
         self.dirty = True
 
     def _save_scale(self) -> None:
@@ -2030,6 +2035,20 @@ class App:
             logging.info("卡片位置已保存: %s, %s", data["pos_x"], data["pos_y"])
         except Exception:
             logging.exception("保存卡片位置失败")
+
+    def _display_card(self):
+        """返回本帧要绘制的卡片/阴影。缩放拖动期间直接位图缩放，避免每帧重建（60~120ms）。"""
+        card, shadow = self._card_with_alpha()
+        z = self.painter.zoom or 1.0
+        pz = self._preview_zoom if self._resizing else z
+        if abs(pz - z) < 0.004:
+            return card, shadow, self.card_pad
+        k = max(0.2, pz / z)
+        card = card.resize((max(4, int(round(card.width * k))),
+                            max(4, int(round(card.height * k)))), Image.BILINEAR)
+        shadow = shadow.resize((max(4, int(round(shadow.width * k))),
+                                max(4, int(round(shadow.height * k)))), Image.BILINEAR)
+        return card, shadow, int(round(self.card_pad * k))
 
     def _card_with_alpha(self):
         """按当前卡片透明度返回（可能缓存的）卡片和阴影图像。"""
@@ -2083,22 +2102,21 @@ class App:
             self.snow.draw(frame)
         if self.show_card and self.card_img is not None:
             x, y = self.card_pos
-            pad = self.card_pad
-            card, shadow = self._card_with_alpha()
+            card, shadow, pad = self._display_card()
             _blend(frame, shadow, x - pad, y - pad)
             _blend(frame, card, x, y)
-            # 悬停时显示右上角关闭按钮与右下角缩放手柄
-            if self._hover or self._dragging or self._resizing:
+            # 悬停时显示右上角关闭按钮与右下角缩放手柄（拖动缩放中不画，避免错位）
+            if not self._resizing and (self._hover or self._dragging):
                 s = self.painter.s
                 close = self._corner_icon("close", max(13, int(round(18 * s))))
                 _blend(frame, close,
-                       x + self.card_img.width - close.width - max(3, int(round(5 * s))),
+                       x + card.width - close.width - max(3, int(round(5 * s))),
                        y + max(3, int(round(5 * s))))
                 grip_size = max(16, int(round(20 * s)))
                 grip = self._corner_icon("grip", grip_size)
                 _blend(frame, grip,
-                       x + self.card_img.width - grip.width - int(round(4 * s)),
-                       y + self.card_img.height - grip.height - int(round(4 * s)))
+                       x + card.width - grip.width - int(round(4 * s)),
+                       y + card.height - grip.height - int(round(4 * s)))
         if self.toast_text:
             if self.toast is None:
                 self.toast = (make_pill(self.art, self.toast_text), time.time() + 3.2)
