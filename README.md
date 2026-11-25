@@ -31,6 +31,17 @@
 
 ---
 
+## 快速开始（免安装）
+
+不装 Python 也能用：到 [Releases](https://github.com/tianlianghaoge-qiu/desktop-weather-snow/releases)
+下载 `桌面天气-v1.x.x-win64.zip`，解压后双击 `桌面天气.exe` 即可运行。
+
+- 关闭：`Ctrl + Alt + Q`，或双击 `关闭桌面天气.vbs`
+- 预览飘雪：双击 `预览飘雪效果.vbs`
+- 同目录下的 `config.json` 可改配置，`weather.log` 是运行日志
+
+> exe 由 PyInstaller 打包，Windows 10/11 x64 直接运行，无需安装 Python 或 Pillow。
+
 ## 运行环境
 
 | 项目 | 要求 |
@@ -186,6 +197,15 @@ pip install pillow
 
 ---
 
+## 自行打包
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_exe.ps1
+```
+
+脚本会安装 PyInstaller 并生成 `dist\桌面天气.exe`（单文件、无控制台窗口）；
+`themes/` 素材通过 `--add-data` 打进包里，配置与日志仍写在 exe 所在目录。
+
 ## 实现原理
 
 - **透明浮层**：`WS_EX_LAYERED` 分层窗口配合 `UpdateLayeredWindow`，把一块预乘 alpha 的 BGRA
@@ -247,6 +267,7 @@ pip install pillow
 
 | 版本 | 主要变更 |
 | --- | --- |
+| v1.3.1 | 提供免安装 exe 发行包（PyInstaller 打包，无需 Python 环境） |
 | v1.3.0 | 详情视图（24 小时温度曲线 + 详细指标）、右键城市菜单、GDI 直接合成（60 帧，单核约 50%） |
 | v1.2.0 | 四季主题 UI、卡片尺寸调节、右上角关闭按钮、默认帧率提升至 60、桌面右键菜单不再导致卡片消失 |
 | v1.1.1 | 天气源自动降级（Open-Meteo → wttr.in），缩短超时与重试间隔 |

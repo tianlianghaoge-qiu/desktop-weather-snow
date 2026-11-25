@@ -56,7 +56,10 @@ except Exception:                      # 没有 GDI 环境时退回整帧 PIL �
 # 常量与路径
 # --------------------------------------------------------------------------------------
 
-APP_DIR = Path(__file__).resolve().parent
+# 打包成独立 exe 后：__file__ 在临时解包目录里，配置与日志要落在 exe 旁边
+FROZEN = bool(getattr(sys, "frozen", False))
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))     # 只读资源（主题素材）所在目录
 CONFIG_PATH = APP_DIR / "config.json"
 LOCATION_CACHE = APP_DIR / "location.json"
 LOG_PATH = APP_DIR / "weather.log"
@@ -645,7 +648,7 @@ THEMES = {
                "file": "winter.jpg"},
 }
 
-THEMES_DIR = APP_DIR / "themes"
+THEMES_DIR = BUNDLE_DIR / "themes"
 
 
 def season_for_month(month: int) -> str:
@@ -755,6 +758,16 @@ def geocode(name: str) -> dict:
     raise RuntimeError(f"找不到城市：{name}")
 
 
+
+def emit(message: str) -> None:
+    """在 --noconsole 打包模式下 sys.stdout 为 None，这里做安全输出。"""
+    stream = sys.stdout
+    if stream is None:
+        return
+    try:
+        print(message)
+    except Exception:
+        pass
 def clean_city(name: str) -> str:
     name = (name or "").strip()
     for suffix in ("市", "地区", "自治州"):
@@ -2547,7 +2560,7 @@ def snapshot(path: str, force_snow: bool, backdrop: str | None, wait: float) -> 
             bg = bg.resize(frame.size, Image.LANCZOS)
         frame = Image.alpha_composite(bg, frame)
     frame.save(path)
-    print(f"已保存 {path} ({frame.width}x{frame.height})")
+    emit(f"已保存 {path} ({frame.width}x{frame.height})")
 
 
 def main(argv=None) -> int:
@@ -2565,7 +2578,7 @@ def main(argv=None) -> int:
     if args.quit:
         broadcast_command(CMD_QUIT)
         signal_quit()
-        print("已通知桌面天气退出")
+        emit("已通知桌面天气退出")
         return 0
 
     if args.snapshot:
@@ -2576,9 +2589,9 @@ def main(argv=None) -> int:
     if mutex is None:
         if args.snow:
             broadcast_command(CMD_SNOW_ON)
-            print("桌面天气已在运行，已切换为飘雪预览")
+            emit("桌面天气已在运行，已切换为飘雪预览")
         else:
-            print("桌面天气已经在运行了（Ctrl+Alt+S 可切换飘雪）")
+            emit("桌面天气已经在运行了（Ctrl+Alt+S 可切换飘雪）")
         return 0
 
     cfg = load_config()
