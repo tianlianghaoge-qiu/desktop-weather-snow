@@ -44,7 +44,7 @@ from ctypes import wintypes as wt
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 # --------------------------------------------------------------------------------------
 # 常量与路径
@@ -75,8 +75,9 @@ DEFAULTS = {
     "opacity": 0.92,
     "idle_opacity": 0.7,
     "scale": 1.0,
+    "theme": "auto",
     "on_desktop": True,
-    "fps": 30,
+    "fps": 60,
     "auto_hide": False,
     "show_card": True,
     "refresh_minutes": 10,
@@ -588,6 +589,39 @@ WMO_ZH = {
 }
 
 WIND_DIRS = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+
+# --------------------------------------------------------------------------------------
+# 季节主题：卡片底色取对应季节的图片，主色与描边随之变化
+# --------------------------------------------------------------------------------------
+THEMES = {
+    "spring": {"label": "春", "accent": (255, 184, 207), "border": (255, 190, 214, 74),
+               "file": "spring.jpg"},
+    "summer": {"label": "夏", "accent": (128, 216, 240), "border": (140, 220, 245, 74),
+               "file": "summer.jpg"},
+    "autumn": {"label": "秋", "accent": (247, 178, 110), "border": (250, 190, 120, 74),
+               "file": "autumn.jpg"},
+    "winter": {"label": "冬", "accent": (170, 214, 255), "border": (150, 208, 255, 78),
+               "file": "winter.jpg"},
+}
+
+THEMES_DIR = APP_DIR / "themes"
+
+
+def season_for_month(month: int) -> str:
+    if month in (3, 4, 5):
+        return "spring"
+    if month in (6, 7, 8):
+        return "summer"
+    if month in (9, 10, 11):
+        return "autumn"
+    return "winter"
+
+
+def resolve_theme(value: str) -> str:
+    value = (value or "auto").strip().lower()
+    if value in THEMES:
+        return value
+    return season_for_month(datetime.now().month)
 
 # wttr.in 用的 WW 天气代码 → Open-Meteo 的 WMO 代码（沿用同一套中文/图标映射）
 WW_TO_WMO = {
@@ -1109,10 +1143,19 @@ class CardPainter:
     def __init__(self, art: Art, cfg: dict):
         self.art = art
         self.cfg = cfg
+        self.theme = resolve_theme(str(cfg.get("theme", "auto")))
         self.zoom = max(0.6, min(2.0, float(cfg.get("scale", 1.0) or 1.0)))
         self.s = art.s * self.zoom
         self._panel_cache = {}
         self._shadow_cache = {}
+        self._photo_cache = {}
+
+    def set_theme(self, theme: str) -> None:
+        if theme == self.theme:
+            return
+        self.theme = theme
+        self._panel_cache.clear()
+        self._photo_cache.clear()
 
     def set_zoom(self, zoom: float) -> None:
         """调整卡片缩放：所有设计尺寸按 zoom 等比放大，缓存随之失效。"""
@@ -1123,18 +1166,77 @@ class CardPainter:
         self.s = self.art.s * zoom
         self._panel_cache.clear()
         self._shadow_cache.clear()
+        self._photo_cache.clear()
 
     # -- 面板底 ----------------------------------------------------------------
+    def _theme_photo(self, w: int, h: int) -> Image.Image:
+        """把季节照片裁成卡片尺寸并虚化压暗，作为玻璃面板的底纹。"""
+        key = (self.theme, w, h)
+        if key in self._photo_cache:
+            return self._photo_cache[key]
+        meta = THEMES.get(self.theme, THEMES["winter"])
+        base = None
+        try:
+            im = Image.open(THEMES_DIR / meta["file"]).convert("RGB")
+            scale = max(w / im.width, h / im.height)
+            nw, nh = int(im.width * scale + 0.5), int(im.height * scale + 0.5)
+            im = im.resize((max(w, nw), max(h, nh)), Image.LANCZOS)
+            left = (im.width - w) // 2
+            top = (im.height - h) // 2
+            base = im.crop((left, top, left + w, top + h))
+            base = base.filter(ImageFilter.GaussianBlur(max(2.0, 7.0 * self.s)))
+            base = ImageEnhance.Brightness(base).enhance(0.80)
+            base = ImageEnhance.Color(base).enhance(1.30)
+        except Exception:
+            logging.info("季节素材缺失: %s", meta.get("file"))
+        if base is None:
+            base = Image.new("RGB", (w, h), (16, 21, 32))
+        photo = base.convert("RGBA")
+        self._photo_cache[key] = photo
+        return photo
+
     def _panel(self, snowy: bool) -> Image.Image:
-        key = snowy
+        key = (snowy, self.theme)
         if key in self._panel_cache:
             return self._panel_cache[key]
         w, h = int(round(self.W * self.s)), int(round(self.H * self.s))
         r = 21 * self.s
+        meta = THEMES.get(self.theme, THEMES["winter"])
         base_alpha = int(max(0.2, min(1.0, float(self.cfg.get("opacity", 0.92)))) * 238)
-        border = (150, 208, 255, 78) if snowy else (255, 255, 255, 34)
-        panel = rounded_panel((w, h), r, fill=(12, 17, 27, base_alpha),
-                              border=border, border_width=max(1.0, 1.1 * self.s))
+
+        # 1) 季节照片 + 圆角裁剪
+        panel = self._theme_photo(w, h).copy()
+        panel.putalpha(rounded_mask((w, h), r))
+
+        # 2) 压一层深色玻璃，保证文字对比度
+        glass = Image.new("RGBA", (w, h), (11, 15, 24, 0))
+        glass.putalpha(rounded_mask((w, h), r).point(lambda v: int(v * base_alpha * 0.60 / 255)))
+        panel = Image.alpha_composite(panel, glass)
+
+        # 2.5) 左侧再压暗一些，让温度与说明文字更清晰
+        scrim = Image.new("L", (256, 1))
+        for i in range(256):
+            scrim.putpixel((i, 0), int(128 * max(0.0, 1.0 - i / 105.0)))
+        scrim = scrim.resize((w, h), Image.BILINEAR)
+        dark = Image.new("RGBA", (w, h), (5, 8, 14, 0))
+        dark.putalpha(ImageChops.multiply(scrim, rounded_mask((w, h), r)))
+        panel = Image.alpha_composite(panel, dark)
+
+        # 3) 右侧季节色渐变，强化主题
+        grad = Image.new("L", (256, 1))
+        for i in range(256):
+            grad.putpixel((i, 0), int(255 * (i / 255.0) ** 2))
+        grad = grad.resize((w, h), Image.BILINEAR)
+        wash = Image.new("RGBA", (w, h), meta["accent"] + (0,))
+        wash.putalpha(grad.point(lambda v: int(v * 0.30)))
+        wash.putalpha(ImageChops.multiply(wash.getchannel("A"), rounded_mask((w, h), r)))
+        panel = Image.alpha_composite(panel, wash)
+
+        # 4) 季节色描边（下雪时换成冰蓝）
+        border = (150, 208, 255, 96) if snowy else meta["border"]
+        outline = rounded_panel((w, h), r, fill=(0, 0, 0, 0), border=border,
+                                border_width=max(1.0, 1.1 * self.s))
+        panel = Image.alpha_composite(panel, outline)
         self._panel_cache[key] = panel
         return panel
 
@@ -1195,7 +1297,8 @@ class CardPainter:
 
         # --- 温度 -----------------------------------------------------------------
         num_w = d.textlength(temp_s, font=f_temp) / s
-        temp_color = (224, 244, 255) if snowy else (250, 252, 255)
+        accent = THEMES.get(self.theme, THEMES["winter"])["accent"]
+        temp_color = (222, 243, 255) if snowy else accent
         put((26, 18), temp_s, f_temp, temp_color)
         if not placeholder:
             put((28 + num_w, 22), "°", f_deg, temp_color, 205)
@@ -1266,6 +1369,15 @@ def make_corner_button(size_px: int, kind: str = "close") -> Image.Image:
             d.line([n * off, n * 0.94, n * 0.94, n * off],
                    fill=(255, 255, 255, 205), width=w)
     return img.resize((size_px, size_px), Image.LANCZOS)
+
+
+def rounded_mask(size: tuple[int, int], radius: float, ss: int = 3) -> Image.Image:
+    """圆角矩形遮罩（超采样后缩小，边缘平滑）。"""
+    w, h = size
+    big = Image.new("L", (w * ss, h * ss), 0)
+    ImageDraw.Draw(big).rounded_rectangle([0, 0, w * ss - 1, h * ss - 1],
+                                          radius * ss, fill=255)
+    return big.resize((w, h), Image.LANCZOS)
 
 
 def rounded_panel(size: tuple[int, int], radius: float, fill, border, border_width: float,
@@ -1457,7 +1569,7 @@ class App:
         self._hover_grip = False
         self._icon_cache = {}
         self.overlay = None
-        self.fps = max(5, min(60, int(cfg.get("fps", 30) or 30)))
+        self.fps = max(5, min(60, int(cfg.get("fps", 60) or 60)))
 
         self.service = WeatherService(cfg)
         self.service.start()
@@ -1527,7 +1639,11 @@ class App:
     def _rebuild_card(self) -> bool:
         data = self.data
         snowy = self.snow.target > 0.02
-        key = (id(data), data.get("stamp") if data else None, snowy)
+        theme = resolve_theme(str(self.cfg.get("theme", "auto")))
+        if theme != self.painter.theme:
+            self.painter.set_theme(theme)
+            self._icon_cache.clear()
+        key = (id(data), data.get("stamp") if data else None, snowy, theme, self.painter.zoom)
         if key == self.card_key and self.card_img is not None:
             return False
         self.card_key = key
