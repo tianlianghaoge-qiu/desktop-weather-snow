@@ -12,7 +12,7 @@
   "idle_opacity": 0.7,
   "scale": 1.0,
   "on_desktop": true,
-  "fps": 20,
+  "fps": 30,
   "auto_hide": false,
   "show_card": true,
   "refresh_minutes": 10

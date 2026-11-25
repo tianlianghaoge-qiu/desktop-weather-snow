@@ -76,7 +76,7 @@ DEFAULTS = {
     "idle_opacity": 0.7,
     "scale": 1.0,
     "on_desktop": True,
-    "fps": 20,
+    "fps": 30,
     "auto_hide": False,
     "show_card": True,
     "refresh_minutes": 10,
@@ -367,6 +367,12 @@ def work_area() -> RECT:
 
 DESKTOP_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
                    "Windows.UI.Core.CoreWindow"}
+
+# 临时浮层（右键菜单、提示气泡、输入法状态条等）不算“遮挡桌面”，
+# 否则在桌面右键、弹出输入法候选框时卡片会误判为被遮挡而消失。
+IGNORABLE_CLASSES = {"#32768", "tooltips_class32", "SysShadow", "IME", "MSCTFIME UI",
+                     "SoPY_Status", "SoPY_Comp", "ForegroundStaging",
+                     "TaskListThumbnailWnd"}
 
 
 def window_class(hwnd) -> str:
@@ -1451,7 +1457,7 @@ class App:
         self._hover_grip = False
         self._icon_cache = {}
         self.overlay = None
-        self.fps = max(5, min(60, int(cfg.get("fps", 20) or 20)))
+        self.fps = max(5, min(60, int(cfg.get("fps", 30) or 30)))
 
         self.service = WeatherService(cfg)
         self.service.start()
@@ -1668,7 +1674,11 @@ class App:
         防止桌面窗口被激活后反把我们盖住。"""
         if not self.overlay or not self.overlay.hwnd:
             return
-        want = "top" if ratio >= 0.97 else "bottom"
+        # 进入用 0.97，退出用 0.88：留出滞回，右键菜单等小块遮挡不会让卡片闪走
+        if self.z_mode == "top":
+            want = "top" if ratio >= 0.88 else "bottom"
+        else:
+            want = "top" if ratio >= 0.97 else "bottom"
         now = time.perf_counter()
         try:
             if want == "top":
@@ -1714,7 +1724,8 @@ class App:
                     seen += 1
                     continue
                 root = user32.GetAncestor(h, 2) or h
-                if window_class(root) in DESKTOP_CLASSES:
+                cls = window_class(root)
+                if cls in DESKTOP_CLASSES or cls in IGNORABLE_CLASSES:
                     seen += 1
                     continue
                 area = small_cache.get(root)

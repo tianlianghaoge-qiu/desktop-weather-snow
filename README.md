@@ -132,7 +132,7 @@ pip install pillow
   "idle_opacity": 0.7,
   "scale": 1.0,
   "on_desktop": true,
-  "fps": 20,
+  "fps": 30,
   "auto_hide": false,
   "show_card": true,
   "refresh_minutes": 10
@@ -152,7 +152,7 @@ pip install pillow
 | `idle_opacity` | number | `0.7` | 指针离开卡片时的不透明度；设为 `1` 可关闭淡出 |
 | `scale` | number | `1.0` | 卡片缩放比例，范围 0.6 ~ 2.0；拖动右下角手柄自动写入 |
 | `on_desktop` | bool | `true` | `true` 位于桌面层不遮挡窗口；`false` 改为置顶悬浮 |
-| `fps` | number | `20` | 渲染帧率，同时决定层级检查频率 |
+| `fps` | number | `30` | 渲染帧率，同时决定层级检查频率；实测 45 左右为上限 |
 | `auto_hide` | bool | `false` | 置顶模式下的自动隐藏开关 |
 | `show_card` | bool | `true` | 是否显示天气卡片 |
 | `refresh_minutes` | number | `10` | 天气刷新间隔（分钟） |
@@ -219,7 +219,7 @@ pip install pillow
 
 | 版本 | 主要变更 |
 | --- | --- |
-| v1.2.0 | 卡片尺寸调节（右下角手柄）、右上角关闭按钮 |
+| v1.2.0 | 卡片尺寸调节（右下角手柄）、右上角关闭按钮、默认帧率提升至 30、桌面右键菜单不再导致卡片消失 |
 | v1.1.1 | 天气源自动降级（Open-Meteo → wttr.in），缩短超时与重试间隔 |
 | v1.1.0 | 桌面层常驻、卡片拖放定位、悬停半透明、显示桌面时不再消失 |
 | v1.0.0 | 首个版本：实时天气卡片与低温飘雪 |
