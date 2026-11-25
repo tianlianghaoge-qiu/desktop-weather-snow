@@ -1,0 +1,17 @@
+# 默认按文本处理
+* text=auto
+
+# Python / Markdown / JSON 用 LF
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+
+# 批处理 / VBScript 保持原样（.vbs 为 UTF-16LE，避免被换行转换破坏）
+*.vbs  -text
+*.bat  -text
+*.cmd  -text
+
+# 图片
+*.png binary
+*.gif binary

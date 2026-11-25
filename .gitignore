@@ -1,0 +1,21 @@
+# 运行时生成
+config.json
+location.json
+weather.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 调试产物
+*.png.tmp
+_dev/
