@@ -31,18 +31,31 @@
 
 ---
 
-## 快速开始（免安装）
+## 下载与运行
 
-不装 Python 也能用：到 [Releases](https://github.com/tianlianghaoge-qiu/desktop-weather-snow/releases)
-下载 `桌面天气-v1.x.x-win64.zip`，解压后双击 `桌面天气.exe` 即可运行。
+到 [Releases](https://github.com/tianlianghaoge-qiu/desktop-weather-snow/releases) 下载最新的
+`desktop-weather-vX.Y.Z-win64.zip`，解压到任意目录，双击 **`桌面天气.exe`** 即可运行。
 
-- 关闭：`Ctrl + Alt + Q`，或双击 `关闭桌面天气.vbs`
-- 预览飘雪：双击 `预览飘雪效果.vbs`
-- 同目录下的 `config.json` 可改配置，`weather.log` 是运行日志
+| 操作 | 方式 |
+| --- | --- |
+| 启动 | 双击 `桌面天气.exe` |
+| 退出 | `Ctrl + Alt + Q`，或双击 `关闭桌面天气.vbs` |
+| 预览飘雪 | 双击 `预览飘雪效果.vbs`（忽略当前气温强制飘雪） |
 
-> exe 由 PyInstaller 打包，Windows 10/11 x64 直接运行，无需安装 Python 或 Pillow。
+首次运行会在程序目录生成以下文件：
 
-## 运行环境
+| 文件 | 说明 |
+| --- | --- |
+| `config.json` | 配置文件，由 `config.example.json` 初始化 |
+| `location.json` | 定位缓存与天气源记录 |
+| `weather.log` | 运行日志，用于排查问题 |
+
+程序为单实例运行，重复启动不会产生多个进程。支持 Windows 10 / 11（64 位），不需要管理员权限，
+不写入注册表。
+
+---
+
+## 从源码运行
 
 | 项目 | 要求 |
 | --- | --- |
@@ -54,33 +67,20 @@
 pip install pillow
 ```
 
+双击 **`桌面天气.vbs`** 以无控制台方式启动：启动器会在常见位置（Anaconda、系统 Python、`PATH`）
+中查找带有 Pillow 的 `pythonw.exe`，找到后拉起 `desktop_weather.py`。双击 `停止桌面天气.vbs`
+退出；双击 `预览飘雪效果.vbs` 强制飘雪（若程序已在运行，会向运行中的实例发送切换命令）。
+
 ---
 
-## 启动与退出
+## 自行打包
 
-### 启动
+```powershell
+powershell -ExecutionPolicy Bypass -File build_exe.ps1
+```
 
-双击 **`桌面天气.vbs`**，以无控制台方式启动。
-
-启动器会自动在常见位置（Anaconda、系统 Python、`PATH`）中查找带有 Pillow 的 `pythonw.exe`，
-找到后以隐藏窗口方式拉起 `desktop_weather.py`。程序为单实例运行，重复启动不会产生多个进程。
-
-首次运行会在程序目录生成以下文件：
-
-| 文件 | 说明 |
-| --- | --- |
-| `config.json` | 配置文件，由 `config.example.json` 初始化，已加入 `.gitignore` |
-| `location.json` | 定位缓存与天气源记录 |
-| `weather.log` | 运行日志，用于排查问题 |
-
-### 退出
-
-双击 `停止桌面天气.vbs`，或按 `Ctrl + Alt + Q`。程序会注销全局热键并销毁浮层后正常退出。
-
-### 预览飘雪
-
-双击 **`预览飘雪效果.vbs`** 可忽略当前气温强制开启飘雪。若程序已在运行，该脚本会向运行中的实例
-发送切换命令，无需重启。
+脚本会安装 PyInstaller 并生成 `dist\桌面天气.exe`（单文件、无控制台窗口）；
+`themes/` 素材通过 `--add-data` 打进包里，配置与日志仍写在 exe 所在目录。
 
 ---
 
@@ -197,15 +197,6 @@ pip install pillow
 
 ---
 
-## 自行打包
-
-```powershell
-powershell -ExecutionPolicy Bypass -File build_exe.ps1
-```
-
-脚本会安装 PyInstaller 并生成 `dist\桌面天气.exe`（单文件、无控制台窗口）；
-`themes/` 素材通过 `--add-data` 打进包里，配置与日志仍写在 exe 所在目录。
-
 ## 实现原理
 
 - **透明浮层**：`WS_EX_LAYERED` 分层窗口配合 `UpdateLayeredWindow`，把一块预乘 alpha 的 BGRA
@@ -256,7 +247,7 @@ powershell -ExecutionPolicy Bypass -File build_exe.ps1
 全屏飘雪、60 帧时约占用单核 50%。可降低 `fps`（30 帧约 25%）或 `snow_density`。程序被窗口
 完全遮挡时会暂停渲染。
 
-### 提示缺少 Python 或 Pillow
+### 从源码运行时提示缺少 Python 或 Pillow
 
 未检测到可用的 Python 环境，或未安装 Pillow。安装 Python 3.9 及以上版本后执行
 `pip install pillow`。
@@ -267,7 +258,7 @@ powershell -ExecutionPolicy Bypass -File build_exe.ps1
 
 | 版本 | 主要变更 |
 | --- | --- |
-| v1.3.1 | 提供免安装 exe 发行包（PyInstaller 打包，无需 Python 环境） |
+| v1.3.1 | 提供 Windows 可执行程序，开箱即用 |
 | v1.3.0 | 详情视图（24 小时温度曲线 + 详细指标）、右键城市菜单、GDI 直接合成（60 帧，单核约 50%） |
 | v1.2.0 | 四季主题 UI、卡片尺寸调节、右上角关闭按钮、默认帧率提升至 60、桌面右键菜单不再导致卡片消失 |
 | v1.1.1 | 天气源自动降级（Open-Meteo → wttr.in），缩短超时与重试间隔 |
