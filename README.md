@@ -154,10 +154,13 @@ pip install pillow
 - **桌面最底层**：去掉 `WS_EX_TOPMOST`，用 `SetWindowPos(HWND_BOTTOM)` 沉底，并在
   `WM_WINDOWPOSCHANGING` 里把任何 Z 序调整强制改回底部 —— 窗口最终正好压在 `Progman`（桌面）之上、
   所有普通窗口之下，所以既不遮挡程序，又能显示在壁纸上。
-- **点击穿透**：`WS_EX_TRANSPARENT`；不抢焦点：`WS_EX_NOACTIVATE`；不进 Alt+Tab：`WS_EX_TOOLWINDOW`。
+- **点击穿透**：`WM_NCHITTEST` 逐点判定 —— 卡片区域返回 `HTCLIENT`（可点、可拖），其余区域返回
+  `HTTRANSPARENT`（继续穿透）。不抢焦点：`WS_EX_NOACTIVATE`；不进 Alt+Tab：`WS_EX_TOOLWINDOW`。
 - **DPI**：`SetProcessDpiAwarenessContext(-4)`（Per-Monitor V2），按物理像素绘制。
-- **天气**：`api.open-meteo.com`（当前温度 / 体感 / 天气代码 / 风向风速 / 今日最高最低）。
-- **定位**：`ip-api.com`（失败时回退 `ipapi.co`），再用 Open-Meteo Geocoding 反查中文地名。
+- **天气**：优先 `api.open-meteo.com`；连不上时自动降级到 `wttr.in`（HTTPS，支持经纬度），
+  并把可用的源记在 `location.json` 里，下次启动直接用，不再等超时。
+- **定位**：`ip-api.com`（失败时回退 `ipapi.co`），再用 Open-Meteo Geocoding 反查中文地名
+  （不可达时回退 wttr.in 反查）。
 - **单实例**：命名互斥体；`预览飘雪效果.vbs` / `停止桌面天气.vbs` 通过
   `PostMessage(HWND_BROADCAST, ...)` 给已运行实例发命令。
 

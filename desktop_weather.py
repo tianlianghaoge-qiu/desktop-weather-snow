@@ -582,6 +582,18 @@ WMO_ZH = {
 
 WIND_DIRS = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
 
+# wttr.in 用的 WW 天气代码 → Open-Meteo 的 WMO 代码（沿用同一套中文/图标映射）
+WW_TO_WMO = {
+    113: 0, 116: 2, 119: 3, 122: 3,
+    143: 45, 248: 45, 260: 45,
+    176: 61, 263: 51, 266: 51, 293: 61, 296: 61, 353: 80,
+    299: 63, 302: 63, 305: 63, 308: 65, 356: 81, 359: 82,
+    179: 71, 182: 73, 185: 73, 317: 71, 320: 73, 362: 85, 365: 85, 368: 71,
+    200: 95, 386: 95, 389: 95,
+    227: 71, 230: 75, 323: 71, 326: 71, 329: 73, 332: 73,
+    335: 75, 338: 75, 350: 77, 374: 77, 377: 77, 371: 75,
+}
+
 
 def weather_text(code: int, is_day: int = 1) -> tuple[str, str]:
     text, kind = WMO_ZH.get(code, ("未知", "cloudy"))
@@ -601,9 +613,9 @@ def wind_text(deg: float, speed: float) -> str:
     return f"{WIND_DIRS[idx]}风 {speed:.0f}km/h"
 
 
-def http_json(url: str, timeout: float = 15.0):
+def http_json(url: str, timeout: float = 15.0, ua: str | None = None):
     req = urllib.request.Request(url, headers={
-        "User-Agent": "DesktopWeather/1.0 (Windows; Open-Meteo)",
+        "User-Agent": ua or "DesktopWeather/1.0 (Windows; Open-Meteo)",
         "Accept": "application/json",
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -630,18 +642,35 @@ def guess_location() -> dict:
 
 
 def geocode(name: str) -> dict:
+    """地名 → 经纬度。优先 Open-Meteo Geocoding，失败时用 wttr.in 反查（国内更稳）。"""
     query = urllib.parse.urlencode({"name": name, "count": 5, "language": "zh", "format": "json"})
-    js = http_json("https://geocoding-api.open-meteo.com/v1/search?" + query, 12)
-    results = js.get("results") or []
-    if not results:
-        raise RuntimeError(f"找不到城市：{name}")
-    item = results[0]
-    return {
-        "lat": float(item["latitude"]),
-        "lon": float(item["longitude"]),
-        "city": item.get("name") or name,
-        "region": item.get("admin1") or "",
-    }
+    try:
+        js = http_json("https://geocoding-api.open-meteo.com/v1/search?" + query, 8)
+        results = js.get("results") or []
+        if results:
+            item = results[0]
+            return {
+                "lat": float(item["latitude"]),
+                "lon": float(item["longitude"]),
+                "city": item.get("name") or name,
+                "region": item.get("admin1") or "",
+            }
+    except Exception as exc:
+        logging.info("Open-Meteo 地理编码不可用: %s", exc)
+    try:
+        js = http_json("https://wttr.in/" + urllib.parse.quote(name) + "?format=j1&lang=zh",
+                       20, ua="curl/8.5.0")
+        area = (js.get("nearest_area") or [None])[0]
+        if area:
+            return {
+                "lat": float(area["latitude"]),
+                "lon": float(area["longitude"]),
+                "city": (area.get("areaName") or [{}])[0].get("value") or name,
+                "region": (area.get("region") or [{}])[0].get("value") or "",
+            }
+    except Exception as exc:
+        logging.info("wttr.in 地理编码不可用: %s", exc)
+    raise RuntimeError(f"找不到城市：{name}")
 
 
 def clean_city(name: str) -> str:
@@ -665,6 +694,14 @@ class WeatherService(threading.Thread):
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._location = None
+        self._preferred = None
+        self._provider_at = 0.0
+        try:
+            cached = self._read_cache() or {}
+            self._preferred = cached.get("provider")
+            self._provider_at = float(cached.get("provider_at") or 0)
+        except Exception:
+            self._preferred = None
 
     # -- 位置 -------------------------------------------------------------------
     def location(self) -> dict:
@@ -710,9 +747,17 @@ class WeatherService(threading.Thread):
         except OSError:
             pass
 
+    def _remember_provider(self, name: str) -> None:
+        """记住当前可用的天气源和时间点：下次启动优先用它，30 分钟后再试探 open-meteo。"""
+        data = self._read_cache() or {}
+        now = round(time.time())
+        data["provider"] = name
+        data["provider_at"] = now
+        self._write_cache(data)
+        self._provider_at = float(now)
+
     # -- 数据 -------------------------------------------------------------------
-    def fetch(self) -> dict:
-        loc = self.location()
+    def _fetch_open_meteo(self, loc: dict) -> dict:
         params = {
             "latitude": f"{loc['lat']:.4f}",
             "longitude": f"{loc['lon']:.4f}",
@@ -722,13 +767,11 @@ class WeatherService(threading.Thread):
             "timezone": "auto",
             "forecast_days": "1",
         }
-        js = http_json("https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(params), 20)
+        js = http_json("https://api.open-meteo.com/v1/forecast?" +
+                       urllib.parse.urlencode(params), 6)
         cur = js["current"]
         daily = js["daily"]
         return {
-            "ok": True,
-            "city": clean_city(loc.get("city") or "当前位置"),
-            "region": loc.get("region") or "",
             "temp": float(cur["temperature_2m"]),
             "feels": float(cur["apparent_temperature"]),
             "humidity": int(cur.get("relative_humidity_2m") or 0),
@@ -738,9 +781,58 @@ class WeatherService(threading.Thread):
             "wind_dir": float(cur.get("wind_direction_10m") or 0.0),
             "tmax": float(daily["temperature_2m_max"][0]),
             "tmin": float(daily["temperature_2m_min"][0]),
-            "clock": datetime.now().strftime("%H:%M"),
-            "stamp": time.time(),
         }
+
+    def _fetch_wttr(self, loc: dict) -> dict:
+        """备用源：wttr.in（HTTPS，支持经纬度，国内通常可达）。"""
+        url = f"https://wttr.in/{loc['lat']:.4f},{loc['lon']:.4f}?format=j1&lang=zh"
+        js = http_json(url, 20, ua="curl/8.5.0")
+        cur = js["current_condition"][0]
+        day = js["weather"][0]
+        ww = int(cur.get("weatherCode") or 113)
+        hour = datetime.now().hour
+        return {
+            "temp": float(cur.get("temp_C") or 0),
+            "feels": float(cur.get("FeelsLikeC") or cur.get("temp_C") or 0),
+            "humidity": int(cur.get("humidity") or 0),
+            "code": WW_TO_WMO.get(ww, 3),
+            "is_day": 1 if 6 <= hour < 18 else 0,
+            "wind": float(cur.get("windspeedKmph") or 0),
+            "wind_dir": float(cur.get("winddirDegree") or 0),
+            "tmax": float(day.get("maxtempC") or 0),
+            "tmin": float(day.get("mintempC") or 0),
+        }
+
+    def fetch(self) -> dict:
+        loc = self.location()
+        providers = [("open-meteo", self._fetch_open_meteo), ("wttr.in", self._fetch_wttr)]
+        # 用备用源超过 30 分钟后，重新把 open-meteo 放回第一位试探一次（它可能已恢复）
+        stale = (time.time() - (self._provider_at or 0)) > 1800
+        if self._preferred and not stale:
+            providers.sort(key=lambda p: 0 if p[0] == self._preferred else 1)
+        last_err = None
+        for name, fn in providers:
+            try:
+                weather = fn(loc)
+                switched = self._preferred != name
+                if switched:
+                    logging.info("天气源切换为 %s", name)
+                    self._preferred = name
+                if switched or stale:
+                    self._remember_provider(name)
+                return {
+                    "ok": True,
+                    "provider": name,
+                    "city": clean_city(loc.get("city") or "当前位置"),
+                    "region": loc.get("region") or "",
+                    "clock": datetime.now().strftime("%H:%M"),
+                    "stamp": time.time(),
+                    **weather,
+                }
+            except Exception as exc:
+                last_err = exc
+                logging.warning("天气源 %s 不可用: %s", name, exc)
+        raise last_err or RuntimeError("没有可用的天气源")
 
     def run(self) -> None:
         delay = 0.0
@@ -756,7 +848,7 @@ class WeatherService(threading.Thread):
                 logging.warning("天气更新失败: %s", exc)
                 with self.lock:
                     self.error = str(exc)
-                delay = 120.0
+                delay = 60.0
             self._wake.wait(delay)
             self._wake.clear()
 
