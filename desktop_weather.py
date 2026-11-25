@@ -35,6 +35,7 @@ import logging
 import math
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -93,6 +94,9 @@ WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 WM_CAPTURECHANGED = 0x0215
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP = 0x0205
+CS_DBLCLKS = 0x0008
 HTCLIENT = 1
 HTTRANSPARENT = -1
 
@@ -293,6 +297,16 @@ user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
 user32.SetProcessDpiAwarenessContext.restype = wt.BOOL
 user32.SetProcessDPIAware.restype = wt.BOOL
 
+user32.CreatePopupMenu.restype = wt.HMENU
+user32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+user32.AppendMenuW.restype = wt.BOOL
+user32.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, wt.HWND, ctypes.c_void_p]
+user32.TrackPopupMenu.restype = ctypes.c_int
+user32.DestroyMenu.argtypes = [wt.HMENU]
+user32.DestroyMenu.restype = wt.BOOL
+user32.SetForegroundWindow.argtypes = [wt.HWND]
+user32.SetForegroundWindow.restype = wt.BOOL
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOPMOST = 0x00000008
@@ -366,6 +380,17 @@ def work_area() -> RECT:
     return rect
 
 
+# 右键菜单
+MF_STRING = 0x0000
+MF_SEPARATOR = 0x0800
+MF_CHECKED = 0x0008
+TPM_LEFTBUTTON = 0x0000
+TPM_RIGHTBUTTON = 0x0002
+TPM_RETURNCMD = 0x0100
+
+CITY_CHOICES = ["北京", "上海", "广州", "深圳", "杭州", "成都",
+                "重庆", "武汉", "西安", "南京", "厦门", "青岛"]
+
 DESKTOP_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
                    "Windows.UI.Core.CoreWindow"}
 
@@ -421,6 +446,7 @@ class Overlay:
             wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
             wc.lpfnWndProc = self._proc
             wc.hInstance = hinst
+            wc.style = CS_DBLCLKS          # 需要双击消息
             wc.lpszClassName = self._class_name
             atom = user32.RegisterClassExW(ctypes.byref(wc))
             if not atom:
@@ -478,6 +504,16 @@ class Overlay:
                 except Exception:
                     logging.exception("命中测试失败")
                 return HTTRANSPARENT
+            if msg == WM_RBUTTONUP:
+                cx, cy = self._unpack(lparam)
+                if self.mouse_cb:
+                    self.mouse_cb("rclick", cx + self.pt_dst.x, cy + self.pt_dst.y)
+                return 0
+            if msg == WM_LBUTTONDBLCLK:
+                cx, cy = self._unpack(lparam)
+                if self.mouse_cb:
+                    self.mouse_cb("dblclick", cx + self.pt_dst.x, cy + self.pt_dst.y)
+                return 0
             if msg in (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE):
                 cx, cy = self._unpack(lparam)          # 客户区坐标
                 sx, sy = cx + self.pt_dst.x, cy + self.pt_dst.y
@@ -722,6 +758,23 @@ def clean_city(name: str) -> str:
     return name
 
 
+def _norm_time(value) -> str:
+    """把 '06:30 AM' / '5:19 PM' / '06:31' 统一成 24 小时制 'HH:MM'。"""
+    text = str(value or "").strip()
+    if not text:
+        return "--"
+    match = re.match(r"(\d{1,2}):(\d{2})\s*([AaPp][Mm])?", text)
+    if not match:
+        return text[:5]
+    hour, minute, ampm = int(match.group(1)), match.group(2), match.group(3)
+    if ampm:
+        if ampm.upper() == "PM" and hour != 12:
+            hour += 12
+        elif ampm.upper() == "AM" and hour == 12:
+            hour = 0
+    return f"{hour:02d}:{minute}"
+
+
 class WeatherService(threading.Thread):
     """后台线程：定位 → 拉取 Open-Meteo → 更新共享数据。"""
 
@@ -803,15 +856,26 @@ class WeatherService(threading.Thread):
             "latitude": f"{loc['lat']:.4f}",
             "longitude": f"{loc['lon']:.4f}",
             "current": "temperature_2m,apparent_temperature,relative_humidity_2m,"
-                       "weather_code,wind_speed_10m,wind_direction_10m,is_day",
-            "daily": "temperature_2m_max,temperature_2m_min",
+                       "weather_code,wind_speed_10m,wind_direction_10m,is_day,"
+                       "surface_pressure,visibility",
+            "daily": "temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max",
+            "hourly": "temperature_2m",
+            "forecast_hours": "24",
             "timezone": "auto",
-            "forecast_days": "1",
+            "forecast_days": "2",
         }
         js = http_json("https://api.open-meteo.com/v1/forecast?" +
                        urllib.parse.urlencode(params), 6)
         cur = js["current"]
         daily = js["daily"]
+        hourly = js.get("hourly") or {}
+        temps = [float(v) for v in (hourly.get("temperature_2m") or []) if v is not None]
+        hours = []
+        for iso in (hourly.get("time") or []):
+            try:
+                hours.append(int(str(iso)[11:13]))
+            except Exception:
+                hours.append(0)
         return {
             "temp": float(cur["temperature_2m"]),
             "feels": float(cur["apparent_temperature"]),
@@ -822,6 +886,13 @@ class WeatherService(threading.Thread):
             "wind_dir": float(cur.get("wind_direction_10m") or 0.0),
             "tmax": float(daily["temperature_2m_max"][0]),
             "tmin": float(daily["temperature_2m_min"][0]),
+            "hourly": temps[:24],
+            "hour_labels": hours[:24],
+            "pressure": float(cur.get("surface_pressure") or 0),
+            "visibility": float(cur.get("visibility") or 0) / 1000.0,
+            "uv": float((daily.get("uv_index_max") or [0])[0] or 0),
+            "sunrise": str((daily.get("sunrise") or [""])[0])[11:16],
+            "sunset": str((daily.get("sunset") or [""])[0])[11:16],
         }
 
     def _fetch_wttr(self, loc: dict) -> dict:
@@ -832,6 +903,19 @@ class WeatherService(threading.Thread):
         day = js["weather"][0]
         ww = int(cur.get("weatherCode") or 113)
         hour = datetime.now().hour
+        # 拼出「从当前小时开始的 24 小时」，wttr 只给 3 小时粒度
+        pairs = []
+        for di, d in enumerate((js.get("weather") or [])[:2]):
+            for slot in d.get("hourly") or []:
+                try:
+                    pairs.append((di * 24 + int(slot.get("time", "0")) // 100,
+                                  float(slot.get("tempC"))))
+                except Exception:
+                    continue
+        pairs = [p for p in pairs if p[0] >= hour][:24]
+        temps = [p[1] for p in pairs]
+        labels = [p[0] % 24 for p in pairs]
+        astro = (day.get("astronomy") or [{}])[0]
         return {
             "temp": float(cur.get("temp_C") or 0),
             "feels": float(cur.get("FeelsLikeC") or cur.get("temp_C") or 0),
@@ -842,6 +926,13 @@ class WeatherService(threading.Thread):
             "wind_dir": float(cur.get("winddirDegree") or 0),
             "tmax": float(day.get("maxtempC") or 0),
             "tmin": float(day.get("mintempC") or 0),
+            "hourly": temps[:24],
+            "hour_labels": labels[:24],
+            "pressure": float(cur.get("pressure") or 0),
+            "visibility": float(cur.get("visibility") or 0),
+            "uv": float(cur.get("uvIndex") or 0),
+            "sunrise": str(astro.get("sunrise") or ""),
+            "sunset": str(astro.get("sunset") or ""),
         }
 
     def fetch(self) -> dict:
@@ -1139,6 +1230,8 @@ class CardPainter:
 
     W = 412.0
     H = 142.0
+    W_EXP = 412.0
+    H_EXP = 272.0
 
     def __init__(self, art: Art, cfg: dict):
         self.art = art
@@ -1195,11 +1288,12 @@ class CardPainter:
         self._photo_cache[key] = photo
         return photo
 
-    def _panel(self, snowy: bool) -> Image.Image:
-        key = (snowy, self.theme)
+    def _panel(self, snowy: bool, expanded: bool = False) -> Image.Image:
+        key = (snowy, self.theme, expanded)
         if key in self._panel_cache:
             return self._panel_cache[key]
-        w, h = int(round(self.W * self.s)), int(round(self.H * self.s))
+        cw, ch = (self.W_EXP, self.H_EXP) if expanded else (self.W, self.H)
+        w, h = int(round(cw * self.s)), int(round(ch * self.s))
         r = 21 * self.s
         meta = THEMES.get(self.theme, THEMES["winter"])
         base_alpha = int(max(0.2, min(1.0, float(self.cfg.get("opacity", 0.92)))) * 238)
@@ -1240,11 +1334,12 @@ class CardPainter:
         self._panel_cache[key] = panel
         return panel
 
-    def _shadow(self, snowy: bool) -> tuple[Image.Image, int]:
-        key = snowy
+    def _shadow(self, snowy: bool, expanded: bool = False) -> tuple[Image.Image, int]:
+        key = (snowy, expanded)
         if key in self._shadow_cache:
             return self._shadow_cache[key]
-        w, h = int(round(self.W * self.s)), int(round(self.H * self.s))
+        cw, ch = (self.W_EXP, self.H_EXP) if expanded else (self.W, self.H)
+        w, h = int(round(cw * self.s)), int(round(ch * self.s))
         r = 21 * self.s
         pad = int(26 * self.s)
         mask = Image.new("L", (w + pad * 2, h + pad * 2), 0)
@@ -1262,10 +1357,11 @@ class CardPainter:
         return self._shadow_cache[key]
 
     # -- 主绘制 ----------------------------------------------------------------
-    def draw(self, data: dict | None, snowy: bool) -> tuple[Image.Image, Image.Image, int]:
+    def draw(self, data: dict | None, snowy: bool,
+             expanded: bool = False) -> tuple[Image.Image, Image.Image, int]:
         s = self.s
-        panel = self._panel(snowy).copy()
-        shadow, pad = self._shadow(snowy)
+        panel = self._panel(snowy, expanded).copy()
+        shadow, pad = self._shadow(snowy, expanded)
         layer = Image.new("RGBA", panel.size, (0, 0, 0, 0))
         d = ImageDraw.Draw(layer)
 
@@ -1322,31 +1418,108 @@ class CardPainter:
             put((380, 50), lo, f_city, (255, 255, 255), 112, anchor="rt")
 
         # --- 底部状态栏 -----------------------------------------------------------
-        d.line([(26 * s, 106 * s), ((self.W - 26) * s, 106 * s)], fill=(255, 255, 255, 16),
-               width=max(1, int(1 * s)))
-        bx, by = 26.0, 114.0
-        if snowy:
-            _snowflake(d, 1.0, (bx + 5) * s, (by + 5.5) * s, 5.4 * s,
-                       SNOW_COLOR[:3] + (245,), max(1, int(1.6 * s)))
-            bx += 16
-            label = "飘雪"
-            put((bx, by), label, f_tiny, ICE_COLOR, 245)
-            bx += d.textlength(label, font=f_tiny) / s + 11
+        if expanded:
+            self._draw_expanded(d, layer, put, data, accent)
+        else:
+            d.line([(26 * s, 106 * s), ((self.W - 26) * s, 106 * s)], fill=(255, 255, 255, 16),
+                   width=max(1, int(1 * s)))
+            bx, by = 26.0, 114.0
+            if snowy:
+                _snowflake(d, 1.0, (bx + 5) * s, (by + 5.5) * s, 5.4 * s,
+                           SNOW_COLOR[:3] + (245,), max(1, int(1.6 * s)))
+                bx += 16
+                label = "飘雪"
+                put((bx, by), label, f_tiny, ICE_COLOR, 245)
+                bx += d.textlength(label, font=f_tiny) / s + 11
+                if humidity is not None:
+                    put((bx, by), "·", f_tiny, (255, 255, 255), 80)
+                    bx += 11
             if humidity is not None:
-                put((bx, by), "·", f_tiny, (255, 255, 255), 80)
-                bx += 11
-        if humidity is not None:
-            put((bx, by), f"湿度 {humidity}%", f_tiny, (255, 255, 255), 125)
-        elif placeholder:
-            put((bx, by), "正在连接…", f_tiny, (255, 255, 255), 90)
+                put((bx, by), f"湿度 {humidity}%", f_tiny, (255, 255, 255), 125)
+            elif placeholder:
+                put((bx, by), "正在连接…", f_tiny, (255, 255, 255), 90)
 
-        if wind:
-            put((206, by), wind, f_tiny, (255, 255, 255), 112)
-        if clock:
-            put((386, by), clock, f_tiny, (255, 255, 255), 105, anchor="rt")
+            if wind:
+                put((206, by), wind, f_tiny, (255, 255, 255), 112)
+            if clock:
+                put((386, by), clock, f_tiny, (255, 255, 255), 105, anchor="rt")
 
         panel.alpha_composite(layer)
         return panel, shadow, pad
+
+    def _draw_expanded(self, d, layer, put, data, accent) -> None:
+        """展开视图：未来 24 小时温度曲线 + 详细指标。"""
+        s = self.s
+        f_lbl = self.art.font("cjk", 9.5 * s)
+        f_val = self.art.font("cjk", 10.5 * s)
+        white = (255, 255, 255)
+        data = data or {}
+        right = self.W_EXP - 26
+
+        d.line([(26 * s, 104 * s), (right * s, 104 * s)], fill=white + (20,),
+               width=max(1, int(1 * s)))
+        put((26, 110), "未来 24 小时", f_lbl, white, 150)
+
+        temps = [float(t) for t in (data.get("hourly") or [])]
+        labels = [int(h) for h in (data.get("hour_labels") or [])]
+        if len(temps) >= 2:
+            self._draw_curve(d, put, 26, 126, 360, 62, temps, labels, accent, f_lbl)
+        else:
+            put((26, 132), "暂无逐小时数据", f_lbl, white, 100)
+
+        d.line([(26 * s, 212 * s), (right * s, 212 * s)], fill=white + (18,),
+               width=max(1, int(1 * s)))
+
+        items1 = [
+            ("湿度", f"{data.get('humidity', '--')}%"),
+            ("风", wind_text(data.get("wind_dir"), data.get("wind")) or "--"),
+            ("气压", f"{data.get('pressure', 0):.0f} hPa" if data.get("pressure") else "--"),
+        ]
+        items2 = [
+            ("能见度", f"{data.get('visibility', 0):.0f} km" if data.get("visibility") else "--"),
+            ("紫外线", f"{data.get('uv', 0):.0f}" if data.get("uv") is not None else "--"),
+            ("日出·日落", (f"{_norm_time(data.get('sunrise'))} / {_norm_time(data.get('sunset'))}"
+                       if data.get("sunrise") else "--")),
+        ]
+        for row, items in ((220, items1), (244, items2)):
+            for col, (label, value) in enumerate(items):
+                x = 26 + col * 126
+                put((x, row), label, f_lbl, white, 108)
+                put((x + d.textlength(label, font=f_lbl) / s + 6, row), value, f_val, white, 225)
+
+    def _draw_curve(self, d, put, x0, y0, w, h, temps, labels, accent, font) -> None:
+        s = self.s
+        n = len(temps)
+        lo, hi = min(temps), max(temps)
+        span = max(1.0, hi - lo)
+        pad = 7.0
+        inner = h - pad * 2
+        pts = []
+        for i, t in enumerate(temps):
+            x = x0 + w * i / (n - 1)
+            y = y0 + pad + inner - inner * (t - lo) / span
+            pts.append((x, y))
+
+        poly = [(p[0] * s, p[1] * s) for p in pts]
+        poly += [((x0 + w) * s, (y0 + h) * s), (x0 * s, (y0 + h) * s)]
+        d.polygon(poly, fill=accent + (26,))
+        d.line([(p[0] * s, p[1] * s) for p in pts],
+               fill=accent + (232,), width=max(1, int(round(1.6 * s))), joint="curve")
+
+        # 当前时刻
+        cx, cy = pts[0][0] * s, pts[0][1] * s
+        r = max(2.0, 2.6 * s)
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255, 240))
+
+
+        # 时间刻度：均匀取 4 个点
+        if len(labels) >= n:
+            picks = sorted({0, max(1, n // 3), max(2, 2 * n // 3), n - 1})
+            for i in picks:
+                if i >= n:
+                    continue
+                label = f"{labels[i]:02d}:00"
+                put((pts[i][0], y0 + h + 3), label, font, (255, 255, 255), 105, anchor="mt")
 
 
 def make_corner_button(size_px: int, kind: str = "close") -> Image.Image:
@@ -1569,6 +1742,8 @@ class App:
         self._clamp_pending = False
         self._hover = False
         self._hover_grip = False
+        self.expanded = False
+        self._pending_menu = None
         self._icon_cache = {}
         self.overlay = None
         self.fps = max(5, min(60, int(cfg.get("fps", 60) or 60)))
@@ -1645,11 +1820,11 @@ class App:
         if theme != self.painter.theme:
             self.painter.set_theme(theme)
             self._icon_cache.clear()
-        key = (id(data), data.get("stamp") if data else None, snowy, theme, self.painter.zoom)
+        key = (id(data), data.get("stamp") if data else None, snowy, theme, self.painter.zoom, self.expanded)
         if key == self.card_key and self.card_img is not None:
             return False
         self.card_key = key
-        self.card_img, self.card_shadow, self.card_pad = self.painter.draw(data, snowy)
+        self.card_img, self.card_shadow, self.card_pad = self.painter.draw(data, snowy, self.expanded)
         self._card_alpha_cache = {}
         if not self._pos_ready:
             self._compute_card_pos()
@@ -1956,6 +2131,13 @@ class App:
                 if new_pos != self.card_pos:
                     self.card_pos = new_pos
                     self.dirty = True
+        elif event == "dblclick":
+            self.expanded = not self.expanded
+            self._clamp_pending = True
+            self._request_card()
+            self.dirty = True
+        elif event == "rclick":
+            self._pending_menu = (sx, sy)
         elif event == "up":
             if self._resizing:
                 self._resizing = False
@@ -2010,6 +2192,52 @@ class App:
             self.cfg.update(patch)
         except Exception:
             logging.exception("保存配置失败")
+
+    def _show_city_menu(self, sx: int, sy: int) -> None:
+        """桌面卡片上右键：选择城市或恢复自动定位。"""
+        if not self.overlay or not self.overlay.hwnd:
+            return
+        hwnd = self.overlay.hwnd
+        menu = user32.CreatePopupMenu()
+        if not menu:
+            return
+        current = (self.cfg.get("city") or "").strip()
+        try:
+            user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if not current else 0),
+                               1, "自动定位")
+            user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            for i, city in enumerate(CITY_CHOICES):
+                flags = MF_STRING | (MF_CHECKED if city == current else 0)
+                user32.AppendMenuW(menu, flags, 100 + i, city)
+            user32.SetForegroundWindow(hwnd)
+            cmd = user32.TrackPopupMenu(
+                menu, TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_RIGHTBUTTON,
+                sx, sy, 0, hwnd, None)
+            if cmd == 1:
+                self._apply_city("")
+            elif cmd >= 100:
+                self._apply_city(CITY_CHOICES[cmd - 100])
+        except Exception:
+            logging.exception("显示城市菜单失败")
+        finally:
+            try:
+                user32.DestroyMenu(menu)
+                user32.PostMessageW(hwnd, 0, 0, 0)
+            except Exception:
+                pass
+
+    def _apply_city(self, city: str) -> None:
+        self._update_config({"city": city})
+        try:
+            self.service._location = None
+            self.service.refresh_now()
+        except Exception:
+            pass
+        self.toast_text = f"切换到 {city}" if city else "已恢复自动定位"
+        self.toast = None
+        self._request_card()
+        self.dirty = True
+        logging.info("城市切换为 %s", city or "(自动定位)")
 
     def _save_position(self) -> None:
         """把拖好的位置写回 config.json，下次启动还在原地。"""
@@ -2143,6 +2371,9 @@ class App:
         next_frame = last
         while self.running:
             self.overlay.pump()
+            if self._pending_menu:
+                pos, self._pending_menu = self._pending_menu, None
+                self._show_city_menu(*pos)
             if self.relayout_pending:
                 self._relayout()
             now = time.perf_counter()
