@@ -385,7 +385,10 @@ def overlay_rect() -> tuple[int, int, int, int]:
     """浮层的覆盖区域：虚拟屏幕，但裁掉贴边的任务栏。
 
     整屏浮层会挡住任务栏上那些 XAML 浮出层（托盘溢出面板、快捷设置）的点击，
-    把它们压在下面后点了没反应；浮层不覆盖任务栏那条即可，雪本来也画不到那里。"""
+    把它们压在下面后点了没反应；浮层不覆盖任务栏那条即可，雪本来也画不到那里。
+
+    任务栏设为自动隐藏时它整条都在屏幕外，此时按它的厚度预留一条，
+    否则鼠标移到屏幕边缘把任务栏唤出来后，那一条又会落在浮层下面。"""
     x, y, w, h = virtual_screen()
     left, top, right, bottom = x, y, x + w, y + h
     for cls in ("Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
@@ -395,16 +398,30 @@ def overlay_rect() -> tuple[int, int, int, int]:
         rect = RECT()
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             continue
-        if rect.right - rect.left <= 0 or rect.bottom - rect.top <= 0:
+        bar_w = rect.right - rect.left
+        bar_h = rect.bottom - rect.top
+        if bar_w <= 0 or bar_h <= 0:
             continue
-        if rect.bottom >= bottom - 2 and rect.top > top:          # 底部任务栏
-            bottom = min(bottom, rect.top)
-        elif rect.top <= top + 2 and rect.bottom < bottom:        # 顶部任务栏
-            top = max(top, rect.bottom)
-        elif rect.left <= left + 2 and rect.right < right:        # 左侧任务栏
-            left = max(left, rect.right)
-        elif rect.right >= right - 2 and rect.left > left:        # 右侧任务栏
-            right = min(right, rect.left)
+        if rect.bottom >= bottom - 2 and rect.top > top:          # 底部（可能半掩）
+            if rect.top + bar_h // 2 >= bottom:                   # 中心在屏幕外：自动隐藏
+                bottom = max(top + 1, bottom - bar_h)
+            else:
+                bottom = min(bottom, rect.top)
+        elif rect.top <= top + 2 and rect.bottom < bottom:        # 顶部
+            if rect.bottom - bar_h // 2 <= top:
+                top = min(bottom - 1, top + bar_h)
+            else:
+                top = max(top, rect.bottom)
+        elif rect.left <= left + 2 and rect.right < right:        # 左侧
+            if rect.right - bar_w // 2 <= left:
+                left = min(right - 1, left + bar_w)
+            else:
+                left = max(left, rect.right)
+        elif rect.right >= right - 2 and rect.left > left:        # 右侧
+            if rect.left + bar_w // 2 >= right:
+                right = max(left + 1, right - bar_w)
+            else:
+                right = min(right, rect.left)
     return left, top, max(1, right - left), max(1, bottom - top)
 
 
