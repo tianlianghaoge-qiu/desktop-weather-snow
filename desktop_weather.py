@@ -381,6 +381,33 @@ def virtual_screen() -> tuple[int, int, int, int]:
     return x, y, w, h
 
 
+def overlay_rect() -> tuple[int, int, int, int]:
+    """浮层的覆盖区域：虚拟屏幕，但裁掉贴边的任务栏。
+
+    整屏浮层会挡住任务栏上那些 XAML 浮出层（托盘溢出面板、快捷设置）的点击，
+    把它们压在下面后点了没反应；浮层不覆盖任务栏那条即可，雪本来也画不到那里。"""
+    x, y, w, h = virtual_screen()
+    left, top, right, bottom = x, y, x + w, y + h
+    for cls in ("Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+        hwnd = user32.FindWindowW(cls, None)
+        if not hwnd or not user32.IsWindowVisible(hwnd):
+            continue
+        rect = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            continue
+        if rect.right - rect.left <= 0 or rect.bottom - rect.top <= 0:
+            continue
+        if rect.bottom >= bottom - 2 and rect.top > top:          # 底部任务栏
+            bottom = min(bottom, rect.top)
+        elif rect.top <= top + 2 and rect.bottom < bottom:        # 顶部任务栏
+            top = max(top, rect.bottom)
+        elif rect.left <= left + 2 and rect.right < right:        # 左侧任务栏
+            left = max(left, rect.right)
+        elif rect.right >= right - 2 and rect.left > left:        # 右侧任务栏
+            right = min(right, rect.left)
+    return left, top, max(1, right - left), max(1, bottom - top)
+
+
 def work_area() -> RECT:
     rect = RECT()
     if not user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
@@ -1770,7 +1797,7 @@ class App:
         self.service.start()
 
         self.scale = dpi_scale()
-        self.vx, self.vy, self.vw, self.vh = virtual_screen()
+        self.vx, self.vy, self.vw, self.vh = overlay_rect()
         self.art = Art(self.scale)
         self.painter = CardPainter(self.art, cfg)
         self.zoom = self.painter.zoom
@@ -1991,9 +2018,27 @@ class App:
         if self._rebuild_card():
             self.dirty = True
 
+    def _covered_by_desktop(self) -> bool:
+        """卡片中心点是否被桌面窗口（Progman / WorkerW）盖住。
+        只有这种情况才需要重新置顶：按 Win+D 后桌面层会升到我们上面。
+        被任务栏浮出层、开始菜单、缩略图预览等盖住时保持原位——它们本就该在上面。"""
+        if self.card_img is None or self.overlay is None:
+            return False
+        try:
+            x, y = self.card_pos
+            pt = POINT(self.vx + x + self.card_img.width // 2,
+                       self.vy + y + self.card_img.height // 2)
+            h = user32.WindowFromPoint(pt)
+            if not h or h == self.overlay.hwnd:
+                return False
+            root = user32.GetAncestor(h, 2) or h
+            return window_class(root) in ("Progman", "WorkerW")
+        except Exception:
+            return False
+
     def _apply_zorder(self, ratio: float) -> None:
-        """平时沉到所有窗口之下；桌面完全露出（Win+D / 只剩桌面）时才置顶，且每次检查都重新置顶，
-        防止桌面窗口被激活后反把我们盖住。"""
+        """平时沉到所有窗口之下；桌面完全露出（Win+D / 只剩桌面）时才置顶。
+        置顶后只在「被桌面层盖住」时重申，避免把后打开的浮出层（快捷设置、托盘溢出）压下去。"""
         if not self.overlay or not self.overlay.hwnd:
             return
         # 进入用 0.97，退出用 0.88：留出滞回，右键菜单等小块遮挡不会让卡片闪走
@@ -2004,8 +2049,14 @@ class App:
         now = time.perf_counter()
         try:
             if want == "top":
-                # 桌面完全露出时用置顶保证可见；不用每次都设，隔 0.4s 重申一次即可
-                if self.z_mode != "top" or now - self._last_top_assert >= 0.4:
+                # 刚进入置顶时设一次；之后只有被桌面层盖住才重申（间隔 0.4s 防抖），
+                # 这样快捷设置、托盘溢出等后打开的浮出层不会被我们顶掉
+                if self.z_mode != "top":
+                    self._last_top_assert = now
+                    user32.SetWindowPos(self.overlay.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                        SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+                elif (now - self._last_top_assert >= 0.4
+                      and self._covered_by_desktop()):
                     self._last_top_assert = now
                     user32.SetWindowPos(self.overlay.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                                         SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
@@ -2470,7 +2521,7 @@ class App:
         logging.info("屏幕参数变化，重新布局")
         self.relayout_pending = False
         self.scale = dpi_scale()
-        self.vx, self.vy, self.vw, self.vh = virtual_screen()
+        self.vx, self.vy, self.vw, self.vh = overlay_rect()
         self.art = Art(self.scale)
         self.painter = CardPainter(self.art, self.cfg)
         self.painter.set_zoom(self.zoom)
